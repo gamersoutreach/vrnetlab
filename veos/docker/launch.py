@@ -117,15 +117,15 @@ class VEOS_vm(vrnetlab.VM):
         self.wait_write("exit")
 
         # gnmic config
-        self.wait_write("management api gnmi")
-        self.wait_write("transport grpc default")
-        self.wait_write("no shutdown")
-        self.wait_write("exit")
+        # self.wait_write("management api gnmi")
+        # self.wait_write("transport grpc default")
+        # self.wait_write("no shutdown")
+        # self.wait_write("exit")
 
         # netconf config
-        self.wait_write("management api netconf")
-        self.wait_write("transport ssh default")
-        self.wait_write("exit")
+        # self.wait_write("management api netconf")
+        # self.wait_write("transport ssh default")
+        # self.wait_write("exit")
 
         self.wait_write(f"hostname {self.hostname}")
 
