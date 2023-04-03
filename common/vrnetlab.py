@@ -93,7 +93,8 @@ class VM:
         # to have them allocated sequential from eth1
         self.highest_provisioned_nic_num = 0
 
-        self.nics_per_pci_bus = 26  # tested to work with XRv
+        # self.nics_per_pci_bus = 26  # tested to work with XRv
+        self.nics_per_pci_bus = 30
         self.smbios = []
 
         self.start_nic_eth_idx = 1

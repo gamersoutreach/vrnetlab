@@ -51,7 +51,8 @@ class VEOS_vm(vrnetlab.VM):
         )
         self.hostname = hostname
         self.conn_mode = conn_mode
-        self.num_nics = 20
+        # self.num_nics = 20
+        self.num_nics = 56
         self.qemu_args.extend(["-cpu", "host,level=9"])
         self.qemu_args.extend(["-smp", "2,sockets=1,cores=1"])
 
