@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
 import datetime
+import ftplib
 import logging
 import os
 import re
 import signal
 import sys
-import ftplib
 
 import vrnetlab
 
@@ -56,6 +56,7 @@ class ROS_vm(vrnetlab.VM):
         self.qemu_args.extend(["-boot", "n"])
         self.hostname = hostname
         self.conn_mode = conn_mode
+        self.nic_type = "virtio-net"  # "e1000" is default but breaks mtu > 1500 on vlan subinterfaces on RouterOS 6.x.x
         self.num_nics = 31
 
         # set up bridge for management interface to a localhost
@@ -83,7 +84,7 @@ class ROS_vm(vrnetlab.VM):
         res.append("-device")
 
         res.append(
-            self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": vrnetlab.gen_mac(0)}
+            self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": self.get_mgmt_mac()}
         )
         res.append("-netdev")
         res.append("bridge,br=br-mgmt,id=br-mgmt" % {"i": 0})
@@ -161,7 +162,10 @@ class ROS_vm(vrnetlab.VM):
         self.wait_write(f"/system identity set name={self.hostname}", wait="")
 
         self.wait_write(
-            f"/ip address add interface=ether1 address={ROS_MGMT_ADDR}/{PREFIX_LENGTH}",
+            # Some RouterOS versions didn't detect interfaces quick enough to reliably accept an IP being assigned to ether1.
+            # ROS 6.45.9 was particularly bad for this. So, tell the router to wait for the interface to appear before trying to add the IP.
+            "{ :local ether1count [/interface ethernet find where name=ether1]; :while ([:len $ether1count] < 1)  do={ :set ether1count [/interface ethernet find where name=ether1]; } };"
+            + f"/ip address add interface=ether1 address={ROS_MGMT_ADDR}/{PREFIX_LENGTH}",
             f"[admin@{self.hostname}] > ",
         )
         # Update admin account if username==admin and there is a password set
@@ -275,4 +279,4 @@ if __name__ == "__main__":
         args.password,
         conn_mode=args.connection_mode,
     )
-    vr.start(add_fwd_rules=False)
+    vr.start()

@@ -2,8 +2,12 @@
 .idea
 venv
 *.qcow2
+cisco*.bin
+*.gz
+*.xz
 *.vmdk
 *.iso
+*cidfile
 
 .DS_Store
 */.DS_Store
@@ -14,3 +18,11 @@ venv
 # Still allow for the common python scripts
 !common/healthcheck.py
 !common/vrnetlab.py
+
+.envrc
+.python-version
+
+*.xml
+
+# ignore clab- dirs
+clab-*

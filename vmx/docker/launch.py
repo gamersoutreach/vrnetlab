@@ -88,13 +88,6 @@ class VMX_vcp(vrnetlab.VM):
         # call parent function to generate first mgmt interface (e1000)
         res = super(VMX_vcp, self).gen_mgmt()
         if not self.install_mode:
-            # append gNMI forwarding if it was not added by common lib
-            if "hostfwd=tcp::57400-10.0.0.15:57400" not in res[-1]:
-                res[-1] = res[-1] + ",hostfwd=tcp::17400-10.0.0.15:57400"
-                vrnetlab.run_command(
-                    ["socat", "TCP-LISTEN:57400,fork", "TCP:127.0.0.1:17400"],
-                    background=True,
-                )
             # add virtio NIC for internal control plane interface to vFPC
             res.append("-device")
             res.append("virtio-net-pci,netdev=vcp-int,mac=%s" % vrnetlab.gen_mac(1))
@@ -203,9 +196,13 @@ class VMX_vcp(vrnetlab.VM):
         self.wait_write("delete system processes dhcp-service")
         # set interface fxp0 on dedicated management vrf, to avoid 10.0.0.0/24 to overlap with any "testing" network
         self.wait_write("set system management-instance")
-        self.wait_write("set routing-instances mgmt_junos description management-instance")
+        self.wait_write(
+            "set routing-instances mgmt_junos description management-instance"
+        )
         # allow NATed outgoing traffic (set the default route on the management vrf)
-        self.wait_write("set routing-instances mgmt_junos routing-options static route 0.0.0.0/0 next-hop 10.0.0.2")
+        self.wait_write(
+            "set routing-instances mgmt_junos routing-options static route 0.0.0.0/0 next-hop 10.0.0.2"
+        )
         self.wait_write("commit")
         self.wait_write("exit")
         # write another exist as sometimes the first exit from exclusive edit abrupts before command finishes
@@ -255,12 +252,14 @@ class VMX_vcp(vrnetlab.VM):
 
 class VMX_vfpc(vrnetlab.VM):
     def __init__(self, version, conn_mode):
-        super(VMX_vfpc, self).__init__(None, None, disk_image="/vmx/vfpc.img", num=1)
-        self.version = version
+        super(VMX_vfpc, self).__init__(
+            None, None, disk_image="/vmx/vfpc.img", num=1, cpu="SandyBridge", smp="3"
+        )
+        self.junos_version = version
         self.num_nics = 96
 
         self.nic_type = "virtio-net-pci"
-        self.qemu_args.extend(["-cpu", "SandyBridge", "-M", "pc", "-smp", "3"])
+        self.qemu_args.extend(["-M", "pc"])
         # add metadata image if it exists
         if os.path.exists("/vmx/metadata-usb-fpc0.img"):
             self.qemu_args.extend(
@@ -289,7 +288,7 @@ class VMX_vfpc(vrnetlab.VM):
             ["-netdev", "tap,ifname=vfpc-int,id=vfpc-int,script=no,downscript=no"]
         )
 
-        if self.version not in ("vmx-14.1R6.4"):
+        if self.junos_version not in ("vmx-14.1R6.4"):
             # dummy interface for some vMX versions - not sure why vFPC wants
             # it but without it we get a misalignment
             res.extend(

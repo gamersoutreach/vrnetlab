@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import datetime
+import ipaddress
 import json
 import logging
 import math
@@ -8,12 +9,36 @@ import os
 import random
 import re
 import subprocess
+import sys
 import telnetlib
 import time
-import sys
 from pathlib import Path
 
+try:
+    from scrapli import Driver
+except ImportError:
+    pass
+
 MAX_RETRIES = 60
+
+DEFAULT_SCRAPLI_TIMEOUT = 900
+
+# set fancy logging colours
+logging.addLevelName(
+    logging.INFO, f"\x1b[1;32m\t{logging.getLevelName(logging.INFO)}\x1b[0m"
+)
+logging.addLevelName(
+    logging.WARN, f"\x1b[1;38;5;220m\t{logging.getLevelName(logging.WARN)}\x1b[0m"
+)
+logging.addLevelName(
+    logging.DEBUG, f"\x1b[1;94m\t{logging.getLevelName(logging.DEBUG)}\x1b[0m"
+)
+logging.addLevelName(
+    logging.ERROR, f"\x1b[1;91m\t{logging.getLevelName(logging.ERROR)}\x1b[0m"
+)
+logging.addLevelName(
+    logging.CRITICAL, f"\x1b[1;91m\t{logging.getLevelName(logging.CRITICAL)}\x1b[0m"
+)
 
 
 def gen_mac(last_octet=None):
@@ -51,7 +76,7 @@ def run_command(cmd, cwd=None, background=False, shell=False):
 def boot_delay():
     delay = os.getenv("BOOT_DELAY")
     if delay and (delay != "" or delay != 0):
-        logging.getLogger().info(f"Delaying VM boot of by {delay} seconds")
+        logging.getLogger().info(f"Delaying VM boot by {delay} seconds")
         time.sleep(int(delay))
 
 
@@ -67,8 +92,68 @@ class VM:
                 return image_info["format"]
         raise ValueError(f"Could not read image format for {self.image}")
 
-    def __init__(self, username, password, disk_image=None, num=0, ram=4096):
+    def __init__(
+        self,
+        username,
+        password,
+        disk_image="",
+        num=0,
+        ram=4096,
+        driveif="ide",
+        provision_pci_bus=True,
+        cpu="host",
+        smp="1",
+        mgmt_passthrough=False,
+        mgmt_dhcp=False,
+        min_dp_nics=0,
+        use_scrapli=False,
+    ):
+        self.use_scrapli = use_scrapli
+
+        # configure logging
         self.logger = logging.getLogger()
+
+        """
+        Configure Scrapli logger to only be INFO level.
+        Scrapli uses 'scrapli' logger by default, and
+        will write all channel i/o as DEBUG log level.
+        """
+        self.scrapli_logger = logging.getLogger("scrapli")
+
+        scrapli_log_level = logging.DEBUG if os.getenv("DEBUG_SCRAPLI", "false").lower() == "true" else logging.INFO
+        self.scrapli_logger.setLevel(scrapli_log_level)
+
+
+
+        # configure scrapli
+        if self.use_scrapli:
+            # init scrapli_tn -- main telnet device
+            scrapli_tn_dev = {
+                "host": "127.0.0.1",
+                "port": 5000 + num,
+                "auth_bypass": True,
+                "auth_strict_key": False,
+                "transport": "telnet",
+                "timeout_socket": 3600,
+                "timeout_transport": 3600,
+                "timeout_ops": 3600,
+            }
+
+            self.scrapli_tn = Driver(**scrapli_tn_dev)
+
+            # init scrapli_qm_dev -- qemu monitor device
+            scrapli_qm_dev = {
+                "host": "127.0.0.1",
+                "port": 4000 + num,
+                "auth_bypass": True,
+                "auth_strict_key": False,
+                "transport": "telnet",
+                "timeout_socket": 3600,
+                "timeout_transport": 3600,
+                "timeout_ops": 3600,
+            }
+
+            self.scrapli_qm = Driver(**scrapli_qm_dev)
 
         # username / password to configure
         self.username = username
@@ -82,7 +167,11 @@ class VM:
         self.p = None
         self.tn = None
 
-        #  various settings
+        self._ram = ram
+        self._cpu = cpu
+        self._smp = smp
+
+        # various settings
         self.uuid = None
         self.fake_start_date = None
         self.nic_type = "e1000"
@@ -93,6 +182,66 @@ class VM:
         # to have them allocated sequential from eth1
         self.highest_provisioned_nic_num = 0
 
+        # Whether the management interface is pass-through or host-forwarded.
+        # Host-forwarded is the original vrnetlab mode where a VM gets a static IP for its management address,
+        # which **does not** match the eth0 interface of a container.
+        # In pass-through mode the VM container uses the same IP as the container's eth0 interface and transparently forwards traffic between the two interfaces.
+        # See https://github.com/hellt/vrnetlab/issues/286
+        self.mgmt_passthrough = (
+            os.environ.get("CLAB_MGMT_PASSTHROUGH", "").lower() == "true"
+            if os.environ.get("CLAB_MGMT_PASSTHROUGH")
+            else mgmt_passthrough
+        )
+
+        # Check if CLAB_MGMT_DHCP environment variable is set
+        self.mgmt_dhcp = (
+            os.environ.get("CLAB_MGMT_DHCP", "").lower() == "true"
+            if os.environ.get("CLAB_MGMT_DHCP")
+            else mgmt_dhcp
+        )
+
+        # Populate management IP and gateway
+        # If CLAB_MGMT_DHCP environment variable is set, we assume that a DHCP client
+        # inside of the VM will take care about setting the management IP and gateway.
+        if self.mgmt_passthrough:
+            if self.mgmt_dhcp:
+                self.mgmt_address_ipv4 = "dhcp"
+                self.mgmt_address_ipv6 = "dhcp"
+                self.mgmt_gw_ipv4 = "dhcp"
+                self.mgmt_gw_ipv6 = "dhcp"
+            else:
+                self.mgmt_address_ipv4, self.mgmt_address_ipv6 = self.get_mgmt_address()
+                self.mgmt_gw_ipv4, self.mgmt_gw_ipv6 = self.get_mgmt_gw()
+        else:
+            self.mgmt_address_ipv4 = "10.0.0.15/24"
+            self.mgmt_address_ipv6 = "2001:db8::2/64"
+            self.mgmt_gw_ipv4 = "10.0.0.2"
+            self.mgmt_gw_ipv6 = "2001:db8::1"
+
+        self.insuffucient_nics = False
+        self.min_nics = 0
+        # if an image needs minimum amount of dataplane nics to bootup, specify
+        if min_dp_nics:
+            self.min_nics = min_dp_nics
+
+        # management subnet properties, defaults
+        self.mgmt_subnet = "10.0.0.0/24"
+        self.mgmt_host_ip = 2
+        self.mgmt_guest_ip = 15
+
+        #  Default TCP ports forwarded (TODO tune per platform):
+        #  80    - http
+        #  443   - https
+        #  830   - netconf
+        #  6030  - gnmi/gnoi arista
+        #  8080  - sonic gnmi/gnoi, other http apis
+        #  9339  - iana gnmi/gnoi
+        #  32767 - gnmi/gnoi juniper
+        #  57400 - nokia gnmi/gnoi
+        self.mgmt_tcp_ports = [80, 443, 830, 6030, 8080, 9339, 32767, 57400]
+
+        # we setup pci bus by default
+        self.provision_pci_bus = provision_pci_bus
         # self.nics_per_pci_bus = 26  # tested to work with XRv
         self.nics_per_pci_bus = 30
         self.smbios = []
@@ -110,6 +259,9 @@ class VM:
             overlay_disk_image = ".".join(tokens)
 
         if not os.path.exists(overlay_disk_image):
+            self.logger.debug(
+                f"class: {self.__class__.__name__}, disk_image: {disk_image}, overlay: {overlay_disk_image}"
+            )
             self.logger.debug("Creating overlay disk image")
             run_command(
                 [
@@ -125,26 +277,56 @@ class VM:
                 ]
             )
 
-        self.qemu_args = ["qemu-system-x86_64", "-display", "none", "-machine", "pc"]
-        self.qemu_args.extend(
-            ["-monitor", "tcp:0.0.0.0:40%02d,server,nowait" % self.num]
-        )
-        self.qemu_args.extend(
-            [
-                "-m",
-                str(ram),
-                "-serial",
-                "telnet:0.0.0.0:50%02d,server,nowait" % self.num,
-                "-drive",
-                "if=ide,file=%s" % overlay_disk_image,
-            ]
-        )
+        self.qemu_args = [
+            "qemu-system-x86_64",
+            "-display",
+            "none",
+            "-machine",
+            "pc",
+            "-monitor",
+            f"tcp:0.0.0.0:40{self.num:02d},server,nowait",
+            "-serial",
+            f"telnet:0.0.0.0:50{self.num:02d},server,nowait",
+            "-m",  # memory
+            str(self.ram),
+            "-cpu",  # cpu type
+            self.cpu,
+            "-smp",
+            self.smp,  # cpu core configuration
+            "-drive",
+            f"if={driveif},file={overlay_disk_image}",
+        ]
+
+        # add additional qemu args if they were provided
+        if self.qemu_additional_args:
+            self.qemu_args.extend(self.qemu_additional_args)
+
         # enable hardware assist if KVM is available
         if os.path.exists("/dev/kvm"):
             self.qemu_args.insert(1, "-enable-kvm")
 
     def start(self):
-        self.logger.info("Starting %s" % self.__class__.__name__)
+        # self.logger.info("Starting %s" % self.__class__.__name__)
+        self.logger.info("START ENVIRONMENT VARIABLES".center(60, "-"))
+        for var, value in sorted(os.environ.items()):
+            self.logger.info(f"{var}: {value}")
+        self.logger.info("END ENVIRONMENT VARIABLES".center(60, "-"))
+
+        self.logger.info(
+            f"Launching {self.__class__.__name__} with {self.smp} SMP/VCPU and {self.ram} M of RAM"
+        )
+
+        # give nice colours. Red if disabled, Green if enabled
+        mgmt_passthrough_coloured = format_bool_color(
+            self.mgmt_passthrough, "Enabled", "Disabled"
+        )
+        use_scrapli_coloured = format_bool_color(
+            self.use_scrapli, "Enabled", "Disabled"
+        )
+
+        self.logger.info(f"Scrapli: {use_scrapli_coloured}")
+        self.logger.info(f"Transparent mgmt interface: {mgmt_passthrough_coloured}")
+
         self.start_time = datetime.datetime.now()
 
         cmd = list(self.qemu_args)
@@ -164,13 +346,17 @@ class VM:
             cmd.extend(["-smbios", quoted_smbios])
 
         # setup PCI buses
-        for i in range(1, math.ceil(self.num_nics / self.nics_per_pci_bus) + 1):
-            cmd.extend(["-device", "pci-bridge,chassis_nr={},id=pci.{}".format(i, i)])
+        if self.provision_pci_bus:
+            for i in range(1, math.ceil(self.num_nics / self.nics_per_pci_bus) + 1):
+                cmd.extend(["-device", f"pci-bridge,chassis_nr={i},id=pci.{i}"])
 
         # generate mgmt NICs
         cmd.extend(self.gen_mgmt())
         # generate normal NICs
         cmd.extend(self.gen_nics())
+        # generate dummy NICs
+        if self.insuffucient_nics:
+            cmd.extend(self.gen_dummy_nics())
 
         self.logger.debug("qemu cmd: {}".format(" ".join(cmd)))
 
@@ -192,10 +378,13 @@ class VM:
 
         for i in range(1, MAX_RETRIES + 1):
             try:
-                self.qm = telnetlib.Telnet("127.0.0.1", 4000 + self.num)
+                if self.use_scrapli:
+                    self.scrapli_qm.open()
+                else:
+                    self.qm = telnetlib.Telnet("127.0.0.1", 4000 + self.num)
                 break
             except:
-                self.logger.info(
+                self.logger.error(
                     "Unable to connect to qemu monitor (port {}), retrying in a second (attempt {})".format(
                         4000 + self.num, i
                     )
@@ -210,10 +399,13 @@ class VM:
 
         for i in range(1, MAX_RETRIES + 1):
             try:
-                self.tn = telnetlib.Telnet("127.0.0.1", 5000 + self.num)
+                if self.use_scrapli:
+                    self.scrapli_tn.open()
+                else:
+                    self.tn = telnetlib.Telnet("127.0.0.1", 5000 + self.num)
                 break
             except:
-                self.logger.info(
+                self.logger.error(
                     "Unable to connect to qemu monitor (port {}), retrying in a second (attempt {})".format(
                         5000 + self.num, i
                     )
@@ -232,117 +424,6 @@ class VM:
         except:
             pass
 
-    def create_bridges(self):
-        """Create a linux bridge for every attached eth interface
-        Returns list of bridge names
-        """
-        # based on https://github.com/plajjan/vrnetlab/pull/188
-        run_command(["mkdir", "-p", "/etc/qemu"])  # This is to whitlist all bridges
-        run_command(["echo 'allow all' > /etc/qemu/bridge.conf"], shell=True)
-
-        bridges = list()
-        intfs = [x for x in os.listdir("/sys/class/net/") if "eth" in x if x != "eth0"]
-        intfs.sort(key=natural_sort_key)
-
-        self.logger.info("Creating bridges for interfaces: %s" % intfs)
-
-        for idx, intf in enumerate(intfs):
-            run_command(
-                ["ip", "link", "add", "name", "br-%s" % idx, "type", "bridge"],
-                background=True,
-            )
-            run_command(["ip", "link", "set", "br-%s" % idx, "up"])
-            run_command(["ip", "link", "set", intf, "mtu", "65000"])
-            run_command(["ip", "link", "set", intf, "master", "br-%s" % idx])
-            run_command(
-                ["echo 16384 > /sys/class/net/br-%s/bridge/group_fwd_mask" % idx],
-                shell=True,
-            )
-            bridges.append("br-%s" % idx)
-        return bridges
-
-    def create_ovs_bridges(self):
-        """Create a OvS bridges for every attached eth interface
-        Returns list of bridge names
-        """
-
-        ifup_script = """#!/bin/sh
-
-        switch="vr-ovs-$1"
-        ip link set $1 up
-        ip link set $1 mtu 65000
-        ovs-vsctl add-port ${switch} $1"""
-
-        with open("/etc/vr-ovs-ifup", "w") as f:
-            f.write(ifup_script)
-        os.chmod("/etc/vr-ovs-ifup", 0o777)
-
-        # start ovs services
-        # system-id doesn't mean anything here
-        run_command(
-            [
-                "/usr/share/openvswitch/scripts/ovs-ctl",
-                f"--system-id={random.randint(1000,50000)}",
-                "start",
-            ]
-        )
-
-        time.sleep(3)
-
-        bridges = list()
-        intfs = [x for x in os.listdir("/sys/class/net/") if "eth" in x if x != "eth0"]
-        intfs.sort(key=natural_sort_key)
-
-        self.logger.info("Creating ovs bridges for interfaces: %s" % intfs)
-
-        for idx, intf in enumerate(intfs):
-            brname = f"vr-ovs-tap{idx+1}"
-            # generate a mac for ovs bridge, since this mac we will need
-            # to create a "drop flow" rule to filter grARP replies we can't have
-            # ref: https://mail.openvswitch.org/pipermail/ovs-discuss/2021-February/050951.html
-            brmac = gen_mac(0)
-            self.logger.debug(f"Creating bridge {brname} with {brmac} hw address")
-            if self.conn_mode == "ovs":
-                run_command(
-                    f"ovs-vsctl add-br {brname} -- set bridge {brname} other-config:hwaddr={brmac}",
-                    shell=True,
-                )
-            if self.conn_mode == "ovs-user":
-                run_command(
-                    f"ovs-vsctl add-br {brname}",
-                    shell=True,
-                )
-                run_command(
-                    f"ovs-vsctl set bridge {brname} datapath_type=netdev",
-                    shell=True,
-                )
-                run_command(
-                    f"ovs-vsctl set bridge {brname} other-config:hwaddr={brmac}",
-                    shell=True,
-                )
-            run_command(["ip", "link", "set", "dev", brname, "mtu", "9000"])
-            run_command(
-                [
-                    "ovs-vsctl",
-                    "set",
-                    "bridge",
-                    brname,
-                    "other-config:forward-bpdu=true",
-                ]
-            )
-            run_command(["ovs-vsctl", "add-port", brname, intf])
-            run_command(["ip", "link", "set", "dev", brname, "up"])
-            run_command(
-                [
-                    "ovs-ofctl",
-                    "add-flow",
-                    brname,
-                    f"table=0,arp,dl_src={brmac} actions=drop",
-                ]
-            )
-            bridges.append(brname)
-        return bridges
-
     def create_tc_tap_ifup(self):
         """Create tap ifup script that is used in tc datapath mode"""
         ifup_script = """#!/bin/bash
@@ -357,78 +438,164 @@ class VM:
         ip link set $TAP_IF mtu 65000
 
         # create tc eth<->tap redirect rules
-        tc qdisc add dev eth$INDEX ingress
-        tc filter add dev eth$INDEX parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev tap$INDEX
+        tc qdisc add dev eth$INDEX clsact
+        tc filter add dev eth$INDEX ingress flower action mirred egress redirect dev tap$INDEX
 
-        tc qdisc add dev $TAP_IF ingress
-        tc filter add dev $TAP_IF parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev eth$INDEX
+        tc qdisc add dev $TAP_IF clsact
+        tc filter add dev $TAP_IF ingress flower action mirred egress redirect dev eth$INDEX
         """
 
         with open("/etc/tc-tap-ifup", "w") as f:
             f.write(ifup_script)
         os.chmod("/etc/tc-tap-ifup", 0o777)
 
-    def create_macvtaps(self):
-        """
-        Create Macvtap interfaces for each non dataplane interface
-        """
-        intfs = [x for x in os.listdir("/sys/class/net/") if "eth" in x if x != "eth0"]
-        self.data_ifaces = intfs
-        intfs.sort(key=natural_sort_key)
+    def create_tc_tap_mgmt_ifup(self):
+        """Create tap ifup script that is used in tc datapath mode, specifically for the management interface"""
+        ifup_script = """#!/bin/bash
 
-        for idx, intf in enumerate(intfs):
-            self.logger.debug("Creating macvtap interfaces for link: %s" % intf)
-            run_command(
-                [
-                    "ip",
-                    "link",
-                    "add",
-                    "link",
-                    intf,
-                    "name",
-                    "macvtap{}".format(idx + 1),
-                    "type",
-                    "macvtap",
-                    "mode",
-                    "passthru",
-                ],
-            )
-            run_command(
-                [
-                    "ip",
-                    "link",
-                    "set",
-                    "dev",
-                    "macvtap{}".format(idx + 1),
-                    "up",
-                ],
-            )
+        ip link set tap0 up
+        ip link set tap0 mtu 65000
+
+        # create tc eth<->tap redirect rules
+
+        tc qdisc add dev eth0 clsact
+        # exception for TCP ports 5000-5007
+        tc filter add dev eth0 ingress prio 1 protocol ip flower ip_proto tcp dst_port 5000-5007 action pass
+        # mirror ARP traffic to container
+        tc filter add dev eth0 ingress prio 2 protocol arp flower action mirred egress mirror dev tap0
+        # redirect rest of ingress traffic of eth0 to egress of tap0
+        tc filter add dev eth0 ingress prio 3 flower action mirred egress redirect dev tap0
+
+        tc qdisc add dev tap0 clsact
+        # redirect all ingress traffic of tap0 to egress of eth0
+        tc filter add dev tap0 ingress flower action mirred egress redirect dev eth0
+
+        # clone management MAC of the VM
+        ip link set dev eth0 address {MGMT_MAC}
+        """
+
+        ifup_script = ifup_script.replace("{MGMT_MAC}", self.mgmt_mac)
+
+        with open("/etc/tc-tap-mgmt-ifup", "w") as f:
+            f.write(ifup_script)
+        os.chmod("/etc/tc-tap-mgmt-ifup", 0o777)
+
+    def get_mgmt_mac(self, last_octet=0) -> str:
+        """Get the MAC address for the management interface from the envvar
+        `CLAB_MGMT_MAC` or generate a random one using `gen_mac(last_octet)`.
+        """
+        return os.environ.get("CLAB_MGMT_MAC") or gen_mac(last_octet)
 
     def gen_mgmt(self):
-        """Generate qemu args for the mgmt interface(s)"""
+        """Generate qemu args for the mgmt interface(s)
+
+        Default TCP ports forwarded:
+          80    - http
+          443   - https
+          830   - netconf
+          6030  - gnmi/gnoi arista
+          8080  - sonic gnmi/gnoi, other http apis
+          9339  - iana gnmi/gnoi
+          32767 - gnmi/gnoi juniper
+          57400 - nokia gnmi/gnoi
+        """
+        if self.mgmt_host_ip + 1 >= self.mgmt_guest_ip:
+            self.logger.error(
+                "Guest IP (%s) must be at least 2 higher than host IP(%s)",
+                self.mgmt_guest_ip,
+                self.mgmt_host_ip,
+            )
+
+        network = ipaddress.ip_network(self.mgmt_subnet)
+        host = str(network[self.mgmt_host_ip])
+        dns = str(network[self.mgmt_host_ip + 1])
+        guest = str(network[self.mgmt_guest_ip])
+
         res = []
-        # mgmt interface is special - we use qemu user mode network
         res.append("-device")
-        res.append(self.nic_type + f",netdev=p00,mac={gen_mac(0)}")
+        self.mgmt_mac = self.get_mgmt_mac()
+
+        res.append(self.nic_type + f",netdev=p00,mac={self.mgmt_mac}")
         res.append("-netdev")
-        res.append(
-            "user,id=p00,net=10.0.0.0/24,"
-            "tftp=/tftpboot,"
-            "hostfwd=tcp::2022-10.0.0.15:22,"
-            "hostfwd=udp::2161-10.0.0.15:161,"
-            "hostfwd=tcp::2830-10.0.0.15:830,"
-            "hostfwd=tcp::2080-10.0.0.15:80,"
-            "hostfwd=tcp::2443-10.0.0.15:443"
-        )
+
+        if self.mgmt_passthrough:
+            # mgmt interface is passthrough - we just create a normal mirred tap interface
+            res.append(
+                "tap,id=p00,ifname=tap0,script=/etc/tc-tap-mgmt-ifup,downscript=no"
+            )
+            self.create_tc_tap_mgmt_ifup()
+        else:
+            # mgmt interface is host-forwarded - we use qemu user mode network
+            # with hostfwd rules to forward ports from the host to the guest
+            res.append(
+                f"user,id=p00,net={self.mgmt_subnet},host={host},dns={dns},dhcpstart={guest},"
+                + f"hostfwd=tcp:0.0.0.0:22-{guest}:22,"  # ssh
+                + f"hostfwd=udp:0.0.0.0:161-{guest}:161,"  # snmp
+                + (
+                    ",".join(
+                        [
+                            f"hostfwd=tcp:0.0.0.0:{p}-{guest}:{p}"
+                            for p in self.mgmt_tcp_ports
+                        ]
+                    )
+                )
+                + ",tftp=/tftpboot"
+            )
+
         return res
+
+    def get_mgmt_address(self):
+        """Returns the IPv4 and IPv6 address of the eth0 interface of the container"""
+        stdout, _ = run_command(["ip", "--json", "address", "show", "dev", "eth0"])
+        command_json = json.loads(stdout.decode("utf-8"))
+        intf_addrinfos = command_json[0]["addr_info"]
+        mgmt_cidr_v4 = None
+        mgmt_cidr_v6 = None
+        for addrinfo in intf_addrinfos:
+            if addrinfo["family"] == "inet" and addrinfo["scope"] == "global":
+                mgmt_address_v4 = addrinfo["local"]
+                mgmt_prefixlen_v4 = addrinfo["prefixlen"]
+                mgmt_cidr_v4 = mgmt_address_v4 + "/" + str(mgmt_prefixlen_v4)
+            if addrinfo["family"] == "inet6" and addrinfo["scope"] == "global":
+                mgmt_address_v6 = addrinfo["local"]
+                mgmt_prefixlen_v6 = addrinfo["prefixlen"]
+                mgmt_cidr_v6 = mgmt_address_v6 + "/" + str(mgmt_prefixlen_v6)
+
+        if not mgmt_cidr_v4:
+            raise ValueError("No IPv4 address set on management interface eth0!")
+
+        return mgmt_cidr_v4, mgmt_cidr_v6
+
+    def get_mgmt_gw(self):
+        """Returns the IPv4 and IPv6 default gateways of the container, used for generating the management default route"""
+        stdout_v4, _ = run_command(["ip", "--json", "-4", "route", "show", "default"])
+        command_json_v4 = json.loads(stdout_v4.decode("utf-8"))
+        try:
+            mgmt_gw_v4 = command_json_v4[0]["gateway"]
+        except IndexError as e:
+            raise IndexError(
+                "No default gateway route on management interface eth0!"
+            ) from e
+
+        stdout_v6, _ = run_command(["ip", "--json", "-6", "route", "show", "default"])
+        command_json_v6 = json.loads(stdout_v6.decode("utf-8"))
+        try:
+            mgmt_gw_v6 = command_json_v6[0]["gateway"]
+        except IndexError:
+            mgmt_gw_v6 = None
+
+        return mgmt_gw_v4, mgmt_gw_v6
 
     def nic_provision_delay(self) -> None:
         self.logger.debug(
             f"number of provisioned data plane interfaces is {self.num_provisioned_nics}"
         )
 
+        # no nics provisioned and/or not running from containerlab so we can bail
         if self.num_provisioned_nics == 0:
-            # no nics provisioned and/or not running from containerlab so we can bail
+            # unless the node has a minimum nic requirement
+            if self.min_nics:
+                self.insuffucient_nics = True
             return
 
         self.logger.debug("waiting for provisioned interfaces to appear...")
@@ -458,38 +625,53 @@ class VM:
                     f"highest allocated interface id determined to be: {self.highest_provisioned_nic_num}..."
                 )
                 self.logger.debug("interfaces provisioned, continuing...")
-                return
+                break
             time.sleep(5)
+
+        # check if we need to provision any more nics, do this after because they shouldn't interfere with the provisioned nics
+        if self.num_provisioned_nics < self.min_nics:
+            self.insuffucient_nics = True
+
+    # if insuffucient amount of nics are defined in the topology file, generate dummmy nics so cat9kv can boot.
+    def gen_dummy_nics(self):
+        # calculate required num of nics to generate
+        nics = self.min_nics - self.num_provisioned_nics
+
+        self.logger.debug(f"Insuffucient NICs defined. Generating {nics} dummy nics")
+
+        res = []
+
+        pci_bus_ctr = self.num_provisioned_nics
+
+        for i in range(0, nics):
+            # dummy interface naming
+            interface_name = f"dummy{str(i + self.num_provisioned_nics)}"
+
+            # PCI bus counter is to ensure pci bus index starts from 1
+            # and continuing in sequence regardles the eth index
+            pci_bus_ctr += 1
+
+            pci_bus = math.floor(pci_bus_ctr / self.nics_per_pci_bus) + 1
+            addr = (pci_bus_ctr % self.nics_per_pci_bus) + 1
+
+            res.extend(
+                [
+                    "-device",
+                    f"{self.nic_type},netdev={interface_name},id={interface_name},mac={gen_mac(i)},bus=pci.{pci_bus},addr=0x{addr}",
+                    "-netdev",
+                    f"tap,ifname={interface_name},id={interface_name},script=no,downscript=no",
+                ]
+            )
+        return res
 
     def gen_nics(self):
         """Generate qemu args for the normal traffic carrying interface(s)"""
         self.nic_provision_delay()
 
         res = []
-        bridges = []
 
         if self.conn_mode == "tc":
             self.create_tc_tap_ifup()
-        elif self.conn_mode in ["ovs", "ovs-user"]:
-            bridges = self.create_ovs_bridges()
-            if len(bridges) > self.num_nics:
-                self.logger.error(
-                    "Number of dataplane interfaces '{}' exceeds the requested number of links '{}'".format(
-                        len(bridges), self.num_nics
-                    )
-                )
-                sys.exit(1)
-        elif self.conn_mode == "macvtap":
-            self.create_macvtaps()
-        elif self.conn_mode == "bridge":
-            bridges = self.create_bridges()
-            if len(bridges) > self.num_nics:
-                self.logger.error(
-                    "Number of dataplane interfaces '{}' exceeds the requested number of links '{}'".format(
-                        len(bridges), self.num_nics
-                    )
-                )
-                sys.exit(1)
 
         start_eth = self.start_nic_eth_idx
         end_eth = self.start_nic_eth_idx + self.num_nics
@@ -518,42 +700,28 @@ class VM:
                 res.extend(
                     [
                         "-device",
-                        "%(nic_type)s,"
-                        "netdev=p%(i)02d,"
-                        "bus=pci.%(pci_bus)s,"
-                        "addr=0x%(addr)x"
-                        % {
-                            "nic_type": self.nic_type,
-                            "i": i,
-                            "pci_bus": pci_bus,
-                            "addr": addr,
-                        },
+                        f"{self.nic_type},netdev=p{i:02d}"
+                        + (
+                            f",bus=pci.{pci_bus},addr=0x{addr:x}"
+                            if self.provision_pci_bus
+                            else ""
+                        ),
                         "-netdev",
-                        "socket,id=p%(i)02d,listen=:%(j)02d" % {"i": i, "j": i + 10000},
+                        f"socket,id=p{i:02d},listen=:{i + 10000:02d}",
                     ]
                 )
                 continue
 
-            mac = ""
-            if self.conn_mode == "macvtap":
-                # get macvtap interface mac that will be used in qemu nic config
-                if not os.path.exists("/sys/class/net/macvtap{}/address".format(i)):
-                    continue
-                with open("/sys/class/net/macvtap%s/address" % i, "r") as f:
-                    mac = f.readline().strip("\n")
-            else:
-                mac = gen_mac(i)
+            mac = gen_mac(i)
 
             res.append("-device")
             res.append(
-                "%(nic_type)s,netdev=p%(i)02d,mac=%(mac)s,bus=pci.%(pci_bus)s,addr=0x%(addr)x"
-                % {
-                    "nic_type": self.nic_type,
-                    "i": i,
-                    "pci_bus": pci_bus,
-                    "addr": addr,
-                    "mac": mac,
-                }
+                f"{self.nic_type},netdev=p{i:02d},mac={mac}"
+                + (
+                    f",bus=pci.{pci_bus},addr=0x{addr:x}"
+                    if self.provision_pci_bus
+                    else ""
+                ),
             )
 
             if self.conn_mode == "tc":
@@ -562,50 +730,6 @@ class VM:
                     f"tap,id=p{i:02d},ifname=tap{i},script=/etc/tc-tap-ifup,downscript=no"
                 )
 
-            if self.conn_mode == "macvtap":
-                # if required number of nics exceeds the number of attached interfaces
-                # we skip excessive ones
-                if not os.path.exists("/sys/class/net/macvtap{}/ifindex".format(i)):
-                    continue
-                # init value of macvtap ifindex
-                tapidx = 0
-                with open("/sys/class/net/macvtap%s/ifindex" % i, "r") as f:
-                    tapidx = f.readline().strip("\n")
-
-                fd = 100 + i  # fd start number for tap iface
-                vhfd = 400 + i  # vhost fd start number
-
-                res.append("-netdev")
-                res.append(
-                    "tap,id=p%(i)02d,fd=%(fd)s,vhost=on,vhostfd=%(vhfd)s %(fd)s<>/dev/tap%(tapidx)s %(vhfd)s<>/dev/vhost-net"
-                    % {"i": i, "fd": fd, "vhfd": vhfd, "tapidx": tapidx}
-                )
-
-            elif self.conn_mode == "bridge":
-                if i <= len(bridges):
-                    bridge = bridges[i - 1]  # We're starting from 0
-                    res.append("-netdev")
-                    res.append(
-                        "bridge,id=p%(i)02d,br=%(bridge)s" % {"i": i, "bridge": bridge}
-                    )
-                else:  # We don't create more interfaces than we have bridges
-                    del res[-2:]  # Removing recently added interface
-
-            elif self.conn_mode in ["ovs", "ovs-user"]:
-                if i <= len(bridges):
-                    res.append("-netdev")
-                    res.append(
-                        "tap,id=p%(i)02d,ifname=tap%(i)s,script=/etc/vr-ovs-ifup,downscript=no"
-                        % {"i": i}
-                    )
-                else:  # We don't create more interfaces than we have bridges
-                    del res[-2:]  # Removing recently added interface
-
-            elif self.conn_mode == "vrxcon":
-                res.append("-netdev")
-                res.append(
-                    "socket,id=p%(i)02d,listen=:%(j)02d" % {"i": i, "j": i + 10000}
-                )
         return res
 
     def stop(self):
@@ -637,12 +761,18 @@ class VM:
         self.stop()
         self.start()
 
-    def wait_write(self, cmd, wait="__defaultpattern__", con=None, clean_buffer=False):
+    def wait_write(
+        self, cmd, wait="__defaultpattern__", con=None, clean_buffer=False, hold=""
+    ):
         """Wait for something on the serial port and then send command
 
         Defaults to using self.tn as connection but this can be overridden
         by passing a telnetlib.Telnet object in the con argument.
         """
+
+        if self.use_scrapli:
+            return self.wait_write_scrapli(cmd, wait)
+
         con_name = "custom con"
         if con is None:
             con = self.tn
@@ -656,20 +786,129 @@ class VM:
             # use class default wait pattern if none was explicitly specified
             if wait == "__defaultpattern__":
                 wait = self.wait_pattern
-            self.logger.trace(f"waiting for '{wait}' on {con_name}")
+            self.logger.info(f"waiting for '{wait}' on {con_name}")
             res = con.read_until(wait.encode())
+
+            while hold and (hold in res.decode()):
+                self.logger.info(
+                    f"Holding pattern '{hold}' detected: {res.decode()}, retrying in 10s..."
+                )
+                con.write("\r".encode())
+                time.sleep(10)
+                res = con.read_until(wait.encode())
 
             cleaned_buf = (
                 (con.read_very_eager()) if clean_buffer else None
             )  # Clear any remaining characters in buffer
 
-            self.logger.trace(f"read from {con_name}: '{res.decode()}'")
+            self.logger.info(f"read from {con_name}: '{res.decode()}'")
             # log the cleaned buffer if it's not empty
             if cleaned_buf:
-                self.logger.trace(f"cleaned buffer: '{cleaned_buf.decode()}'")
+                self.logger.info(f"cleaned buffer: '{cleaned_buf.decode()}'")
 
         self.logger.debug(f"writing to {con_name}: '{cmd}'")
         con.write("{}\r".format(cmd).encode())
+
+    def wait_write_scrapli(self, cmd, wait="__defaultpattern__"):
+        """
+        Wait for something on the serial port and then send command using Scrapli telnet channel
+
+        Arguments are:
+        - cmd: command to send (string)
+        - wait: prompt to wait for before sending command, defaults to # (string)
+        """
+        if wait:
+            # use class default wait pattern if none was explicitly specified
+            if wait == "__defaultpattern__":
+                wait = self.wait_pattern
+
+            self.logger.info(f"Waiting on console for: '{wait}'")
+
+            self.con_read_until(wait)
+
+        time.sleep(0.1)  # don't write to the console too fast
+
+        self.write_to_stdout(b"\n")
+
+        self.logger.info(f"Writing to console: '{cmd}'")
+        self.scrapli_tn.channel.write(f"{cmd}\r")
+
+    def con_expect(self, regex_list, timeout=None):
+        """
+        Implements telnetlib expect() functionality, for usage with scrapli driver.
+        Wait for something on the console.
+
+        Takes list of byte strings and an optional timeout (block) time (float) as arguments.
+
+        Returns tuple of:
+        - index of matched object from regex.
+        - match object.
+        - buffer of cosole read until match, or function exit.
+        """
+
+        buf = b""
+
+        if timeout:
+            t_end = time.time() + timeout
+            while time.time() < t_end:
+                buf += self.scrapli_tn.channel.read()
+        else:
+            buf = self.scrapli_tn.channel.read()
+
+        for i, obj in enumerate(regex_list):
+            match = re.search(obj.decode(), buf.decode())
+            if match:
+                return i, match, buf
+
+        return -1, None, buf
+
+    def con_read_until(self, match_str, timeout=None):
+        """
+        Implements telnetlib read_until() functionality, for usage with scrapli driver.
+
+        Read until a given string is encountered or until timeout.
+
+        When no match is found, return whatever is available instead,
+        possibly the empty string.
+
+        Arguments:
+        - match_str: string to match on (string)
+        - timeout: timeout in seconds, defaults to None (float)
+        """
+        buf = b""
+
+        if timeout:
+            t_end = time.time() + timeout
+
+        while True:
+            current_buf = self.scrapli_tn.channel.read()
+            buf += current_buf
+
+            match = re.search(match_str, current_buf.decode())
+
+            # for reliability purposes, doublecheck the entire buffer
+            # maybe the current buffer only has partial output
+            if match is None:
+                match = re.search(match_str, buf.decode())
+
+            self.write_to_stdout(current_buf)
+
+            if match:
+                break
+            if timeout and time.time() > t_end:
+                break
+
+        return buf
+
+    def write_to_stdout(self, bytes):
+        """
+        Quick and dirty way to write to stdout (docker logs) instead of
+        using the python logger which poorly formats the output.
+
+        Mainly for printing console to docker logs
+        """
+        sys.stdout.buffer.write(bytes)
+        sys.stdout.buffer.flush()
 
     def work(self):
         self.check_qemu()
@@ -701,10 +940,83 @@ class VM:
             self.stop()
             self.start()
 
+    @property
+    def version(self):
+        """Read version number from VERSION environment variable
+
+        The VERSION environment variable is set at build time using the value
+        from the makefile. If the environment variable is not defined please add
+        the variables in the Dockerfile (see csr)"""
+        version = os.environ.get("VERSION")
+        if version is not None:
+            return version
+        raise ValueError("The VERSION environment variable is not set")
+
+    @property
+    def ram(self):
+        """
+        Read memory size from the QEMU_MEMORY environment variable and use it in the qemu parameters for the VM.
+        If the QEMU_MEMORY environment variable is not set, use the default value.
+        Should be provided as a number of MB. e.g. 4096.
+        """
+
+        if "QEMU_MEMORY" in os.environ:
+            return get_digits(str(os.getenv("QEMU_MEMORY")))
+
+        return self._ram
+
+    @property
+    def cpu(self):
+        """
+        Read the CPU type the QEMU_CPU environment variable and use it in the qemu parameters for the VM.
+        If the QEMU_CPU environment variable is not set, use the default value.
+        """
+
+        if "QEMU_CPU" in os.environ:
+            return str(os.getenv("QEMU_CPU"))
+
+        return str(self._cpu)
+
+    @property
+    def smp(self):
+        """
+        Read SMP parameter (e.g. number of CPU cores) from the QEMU_SMP environment variable.
+        If the QEMU_SMP parameter is not set, the default value is used.
+        Should be provided as a number, e.g. 2
+        """
+
+        if "QEMU_SMP" in os.environ:
+            return str(os.getenv("QEMU_SMP"))
+
+        return str(self._smp)
+
+    @property
+    def qemu_additional_args(self):
+        """
+        Read additional qemu arguments (e.g. number of CPU cores) from the QEMU_ADDITIONAL_ARGS environment variable.
+        If the QEMU_ADDITIONAL_ARGS parameter is not set, nothing is added to the default args set.
+        Should be provided as a space separated list of arguments, e.g. "-machine pc -display none"
+        """
+
+        if "QEMU_ADDITIONAL_ARGS" in os.environ:
+            s = str(os.getenv("QEMU_ADDITIONAL_ARGS"))
+            if s:
+                return s.split()
+
 
 class VR:
-    def __init__(self, username, password):
+    def __init__(self, username, password, mgmt_passthrough: bool = False):
         self.logger = logging.getLogger()
+
+        # Whether the management interface is pass-through or host-forwarded.
+        # Host-forwarded is the original vrnetlab mode where a VM gets a static IP for its management address,
+        # which **does not** match the eth0 interface of a container.
+        # In pass-through mode the VM container uses the same IP as the container's eth0 interface and transparently forwards traffic between the two interfaces.
+        # See https://github.com/hellt/vrnetlab/issues/286
+        self.mgmt_passthrough = mgmt_passthrough
+        mgmt_passthrough_override = os.environ.get("CLAB_MGMT_PASSTHROUGH", "")
+        if mgmt_passthrough_override:
+            self.mgmt_passthrough = mgmt_passthrough_override.lower() == "true"
 
         try:
             os.mkdir("/tftpboot")
@@ -716,26 +1028,10 @@ class VR:
         health_file.write("%d %s" % (exit_status, message))
         health_file.close()
 
-    def start(self, add_fwd_rules=True):
+    def start(self):
         """Start the virtual router"""
         self.logger.debug("Starting vrnetlab %s" % self.__class__.__name__)
         self.logger.debug("VMs: %s" % self.vms)
-        if add_fwd_rules:
-            run_command(
-                ["socat", "TCP-LISTEN:22,fork", "TCP:127.0.0.1:2022"], background=True
-            )
-            run_command(
-                ["socat", "UDP-LISTEN:161,fork", "UDP:127.0.0.1:2161"], background=True
-            )
-            run_command(
-                ["socat", "TCP-LISTEN:830,fork", "TCP:127.0.0.1:2830"], background=True
-            )
-            run_command(
-                ["socat", "TCP-LISTEN:80,fork", "TCP:127.0.0.1:2080"], background=True
-            )
-            run_command(
-                ["socat", "TCP-LISTEN:443,fork", "TCP:127.0.0.1:2443"], background=True
-            )
 
         started = False
         while True:
@@ -754,54 +1050,74 @@ class VR:
                 else:
                     self.update_health(1, "starting")
 
+            # file-based signalling backdoor to trigger a system reset (via qemu-monitor) on all or specific VMs.
+            # if file is empty: reset whole VR (all VMs)
+            # if file is non-empty: reset only specified VMs (comma separated list)
+            if os.path.exists("/reset"):
+                with open("/reset", "rt") as f:
+                    fcontent = f.read().strip()
+                vm_num_list = fcontent.split(",")
+                for vm in self.vms:
+                    if (str(vm.num) in vm_num_list) or not fcontent:
+                        try:
+                            if vm.use_scrapli:
+                                vm.scrapli_qm.channel.write("system_reset\r")
+                            else:
+                                vm.qm.write("system_reset\r".encode())
+                            self.logger.debug(
+                                f"Sent qemu-monitor system_reset to VM num {vm.num} "
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to send qemu-monitor system_reset to VM num {vm.num} ({e})"
+                            )
+                try:
+                    os.remove("/reset")
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to cleanup /reset file({e}). qemu-monitor system_reset will likely be triggered again on VMs"
+                    )
+
 
 class QemuBroken(Exception):
     """Our Qemu instance is somehow broken"""
 
 
-# getMem returns the RAM size (in Mb) for a given VM mode.
-# RAM can be specified in the variant dict, provided by a user via the custom type definition,
-# or set via env vars.
-# If set via env vars, the getMem will return this value as the most specific one.
-# Otherwise, the ram provided to this function will be converted to Mb and returned.
-def getMem(vmMode: str, ram: int) -> int:
-    if vmMode == "integrated":
-        # Integrated VM can use both MEMORY and CP_MEMORY env vars
-        if "MEMORY" in os.environ:
-            return 1024 * get_digits(os.getenv("MEMORY"))
-        if "CP_MEMORY" in os.environ:
-            return 1024 * get_digits(os.getenv("CP_MEMORY"))
-    if vmMode == "cp":
-        if "CP_MEMORY" in os.environ:
-            return 1024 * get_digits(os.getenv("CP_MEMORY"))
-    if vmMode == "lc":
-        if "LC_MEMORY" in os.environ:
-            return 1024 * get_digits(os.getenv("LC_MEMORY"))
-    return 1024 * int(ram)
-
-
-# getCpu returns the number of cpu cores for a given VM mode.
-# Cpu can be specified in the variant dict, provided by a user via the custom type definition,
-# or set via env vars.
-# If set via env vars, the function will return this value as the most specific one.
-# Otherwise, the number provided to this function via cpu param returned.
-def getCpu(vsimMode: str, cpu: int) -> int:
-    if vsimMode == "integrated":
-        # Integrated VM can use both MEMORY and CP_MEMORY env vars
-        if "CPU" in os.environ:
-            return int(os.getenv("CPU"))
-        if "CP_CPU" in os.environ:
-            return int(os.getenv("CP_CPU"))
-    if vsimMode == "cp":
-        if "CP_CPU" in os.environ:
-            return int(os.getenv("CP_CPU"))
-    if vsimMode == "lc":
-        if "LC_CPU" in os.environ:
-            return int(os.getenv("LC_CPU"))
-    return cpu
-
-
-# strip all non-numeric characters from a string
 def get_digits(input_str: str) -> int:
+    """
+    Strip all non-numeric characters from a string
+    """
+
     non_string_chars = re.findall(r"\d", input_str)
     return int("".join(non_string_chars))
+
+
+def cidr_to_ddn(prefix: str) -> list[str]:
+    """
+    Convert a IPv4 CIDR notation prefix to address + mask in DDN notation
+
+    Returns a list of IP address (str) and mask (str) in dotted decimal
+
+    Example:
+    get_ddn_mask('192.168.0.1/24')
+    returns ['192.168.0.1' ,'255.255.255.0']
+    """
+
+    network = ipaddress.IPv4Interface(prefix)
+    return [str(network.ip), str(network.netmask)]
+
+
+def format_bool_color(bool_var: bool, text_if_true: str, text_if_false: str) -> str:
+    """
+    Generate a ANSI escape code colored string based on a boolean.
+
+    Args:
+    bool_var:       Boolean to be evaluated
+    text_if_true:   Text returned if bool_var is true -- ANSI Formatted in green color
+    text_if_false:  Text returned if bool_var is false -- ANSI Formatted in red color
+    """
+    return (
+        f"\x1b[32m{text_if_true}\x1b[0m"
+        if bool_var
+        else f"\x1b[31m{text_if_false}\x1b[0m"
+    )

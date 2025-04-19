@@ -7,11 +7,13 @@ import re
 import shutil
 import signal
 import sys
-from typing import Dict
 from dataclasses import dataclass
-
+from typing import Dict
 
 import vrnetlab
+from scrapli import Scrapli
+
+LOG_SCRAPLI = True if os.getenv("LOG_SCRAPLI", "false").lower() == "true" else False
 
 
 def handle_SIGCHLD(signal, frame):
@@ -39,15 +41,59 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
+# getMem returns the RAM size (in Mb) for a given VM mode.
+# RAM can be specified in the variant dict, provided by a user via the custom type definition,
+# or set via env vars.
+# If set via env vars, the getMem will return this value as the most specific one.
+# Otherwise, the ram provided to this function will be converted to Mb and returned.
+def getMem(vmMode: str, ram: int) -> int:
+    if vmMode == "integrated":
+        # Integrated VM can use both MEMORY and CP_MEMORY env vars
+        if "MEMORY" in os.environ:
+            return 1024 * vrnetlab.get_digits(os.getenv("MEMORY"))
+        if "CP_MEMORY" in os.environ:
+            return 1024 * vrnetlab.get_digits(os.getenv("CP_MEMORY"))
+    if vmMode == "cp":
+        if "CP_MEMORY" in os.environ:
+            return 1024 * vrnetlab.get_digits(os.getenv("CP_MEMORY"))
+    if vmMode == "lc":
+        if "LC_MEMORY" in os.environ:
+            return 1024 * vrnetlab.get_digits(os.getenv("LC_MEMORY"))
+    return 1024 * int(ram)
+
+
+# getCpu returns the number of cpu cores for a given VM mode.
+# Cpu can be specified in the variant dict, provided by a user via the custom type definition,
+# or set via env vars.
+# If set via env vars, the function will return this value as the most specific one.
+# Otherwise, the number provided to this function via cpu param returned.
+def getCpu(vsimMode: str, cpu: int) -> int:
+    if vsimMode == "integrated":
+        # Integrated VM can use both MEMORY and CP_MEMORY env vars
+        if "CPU" in os.environ:
+            return int(os.getenv("CPU"))
+        if "CP_CPU" in os.environ:
+            return int(os.getenv("CP_CPU"))
+    if vsimMode == "cp":
+        if "CP_CPU" in os.environ:
+            return int(os.getenv("CP_CPU"))
+    if vsimMode == "lc":
+        if "LC_CPU" in os.environ:
+            return int(os.getenv("LC_CPU"))
+    return cpu
+
+
 @dataclass
 class SROSVersion:
     """SROSVersion is a dataclass that stores SROS version components
 
+    magc is a boolean indicating whether or not this is a magc image (and thus, classic cli)
     version is a string repr of a version number, e.g. "22.10.R1"
     major, minor, patch are integers representing the version number components
-    patch version that is typically in the form of R1, R2, etc. will be stripped to integer only
+    patch version that is typically in the form of R1, R2, R2-1, etc.
     """
 
+    magc: bool
     version: str
     major: int
     minor: int
@@ -55,7 +101,7 @@ class SROSVersion:
 
 
 # SROS_VERSION global variable is used to store the SROS version components
-SROS_VERSION = SROSVersion(version="", major=0, minor=0, patch=0)
+SROS_VERSION = SROSVersion(version="", major=0, minor=0, patch=0, magc=False)
 
 
 # line_card_config is a convenience function that generates line card definition strings
@@ -152,6 +198,66 @@ SROS_VARIANTS = {
             }
         ],
     },
+    "ixr-x1": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 36,  # 32 * qsfp28 + 4 * qsfpdd
+        "cp": {
+            "min_ram": 3,
+            "timos_line": "chassis=ixr-x slot=A card=cpm-ixr-x/imm32-qsfp28+4-qsfpdd",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="ixr-x",
+                    card="imm32-qsfp28+4-qsfpdd",
+                    mda="m32-qsfp28+4-qsfpdd",
+                ),
+            }
+        ],
+    },
+    "ixr-xs": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 54,  # 6 * qsfpdd + 48 * sfp56
+        "cp": {
+            "min_ram": 3,
+            "timos_line": "chassis=ixr-x slot=A card=cpm-ixr-x/imm6-qsfpdd+48-sfp56",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="ixr-x",
+                    card="imm6-qsfpdd+48-sfp56",
+                    mda="m6-qsfpdd+48-sfp56",
+                ),
+            }
+        ],
+    },
+    "ixr-x3": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 36,  # 36 * qsfpdd
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "chassis=ixr-x3 slot=A card=cpm-ixr-x/imm36-qsfpdd",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 5,
+                **line_card_config(
+                    chassis="ixr-x3",
+                    card="imm36-qsfpdd",
+                    mda="m36-qsfpdd",
+                ),
+            }
+        ],
+    },
     "ixr-e-small": {
         "deployment_model": "distributed",
         # control plane (CPM)
@@ -182,10 +288,21 @@ SROS_VARIANTS = {
             integrated=True,
         ),
     },
-
+    "ixr-e2c": {
+        "deployment_model": "integrated",
+        "min_ram": 4,  # minimum RAM requirements
+        "max_nics": 30,
+        **line_card_config(
+            chassis="ixr-e2c",
+            card="cpm-ixr-e2c",
+            card_type="imm12-sfp28+2-qsfp28",
+            mda="m12-sfp28+2-qsfp28",
+            integrated=True,
+        ),
+    },
     "ixr-e2": {
         "deployment_model": "integrated",
-        "min_ram": 4, # minimum RAM requirements
+        "min_ram": 4,  # minimum RAM requirements
         "max_nics": 30,
         **line_card_config(
             chassis="ixr-e2",
@@ -195,8 +312,6 @@ SROS_VARIANTS = {
             integrated=True,
         ),
     },
-
-
     "sr-1s": {
         "deployment_model": "integrated",
         "min_ram": 6,  # minimum RAM requirements
@@ -246,6 +361,28 @@ SROS_VARIANTS = {
             },
         ],
     },
+    "sr-2se": {
+        "deployment_model": "distributed",
+        "max_nics": 36,
+        "power": {"modules": {"ac/hv": 3, "dc": 4}},
+        "cp": {
+            "min_ram": 4,
+            # The 7750 SR-2se uses an integrated switch fabric module (SFM) design
+            "timos_line": "slot=A chassis=sr-2se sfm=sfm-2se card=cpm-2se",
+        },
+        "lcs": [
+            {
+                "min_ram": 8,
+                "timos_line": "slot=1 chassis=sr-2se sfm=sfm-2se card=xcm-2se mda/1=x2-s36-800g-qsfpdd-18.0t",
+                "card_config": """
+/configure sfm 1 sfm-type sfm-2se
+/configure sfm 2 sfm-type sfm-2se
+/configure card 1 card-type xcm-2se
+/configure card 1 mda 1 mda-type x2-s36-800g-qsfpdd-18.0t
+""",
+            },
+        ],
+    },
     "sr-7s": {  # defaults to FP5 cards
         "deployment_model": "distributed",
         # control plane (CPM)
@@ -290,12 +427,31 @@ SROS_VARIANTS = {
                 /configure sfm 2 sfm-type sfm-s
                 /configure sfm 3 sfm-type sfm-s
                 /configure sfm 4 sfm-type sfm-s
-                /configure sfm 5 sfm-type sfm-s
-                /configure sfm 6 sfm-type sfm-s
-                /configure sfm 7 sfm-type sfm-s
-                /configure sfm 8 sfm-type sfm-s
                 /configure card 1 card-type xcm-7s
                 /configure card 1 mda 1 mda-type s36-100gb-qsfp28
+                """,
+            }
+        ],
+    },
+    "sr-7-secgw": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 16,
+        "power": {"modules": 10, "shelves": 2},
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=SR-7 sfm=m-sfm6-7/12 card=cpm5",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 6,
+                "timos_line": "slot=1 chassis=SR-7 sfm=m-sfm6-7/12 card=iom4-e mda/1=me12-10/1gb-sfp+ mda/2=isa2-tunnel",
+                "card_config": """
+                /configure sfm 1 sfm-type m-sfm6-7/12
+                /configure card 1 card-type iom4-e
+                /configure card 1 mda 1 mda-type me12-10/1gb-sfp+
+                /configure card 1 mda 2 mda-type isa2-tunnel
                 """,
             }
         ],
@@ -368,14 +524,16 @@ SROS_VARIANTS = {
             "timos_line": "slot=A chassis=sr-1e card=cpm-e",
         },
         # line card (IOM/XCM)
-        "lc": {
-            "min_ram": 4,
-            "timos_line": "chassis=sr-1e slot=1 card=iom-e mda/1=me12-10/1gb-sfp+ mda/2=isa2-tunnel",
-            "card_config": """/configure card 1 card-type iom-e
+        "lcs": [
+            {
+                "min_ram": 4,
+                "timos_line": "chassis=sr-1e slot=1 card=iom-e mda/1=me12-10/1gb-sfp+ mda/2=isa2-tunnel",
+                "card_config": """/configure card 1 card-type iom-e
             /configure card 1 mda 1 mda-type me12-10/1gb-sfp+
             /configure card 1 mda 2 mda-type isa2-tunnel
             """,
-        },
+            },
+        ],
     },
     "sr-a4": {
         "deployment_model": "distributed",
@@ -386,27 +544,137 @@ SROS_VARIANTS = {
             "timos_line": "slot=A chassis=sr-a4 card=cpm-a",
         },
         # line card (IOM/XCM)
-        "lc": {
-            "min_ram": 4,
-            **line_card_config(
-                chassis="sr-a4", card="iom-a", mda="maxp10-10/1gb-msec-sfp+"
-            ),
-        },
+        "lcs": [
+            {
+                "min_ram": 4,
+                "timos_line": "slot=A chassis=sr-a4 card=cpm-a",
+                **line_card_config(
+                    chassis="sr-a4", card="iom-a", mda="maxp10-10/1gb-msec-sfp+"
+                ),
+            },
+        ],
     },
-    "sr-1x-48d": {
+    ### SR-1 FP5 models (six variants with sfp-dd or qsfpdd only):
+    # SR-1 FP5 - CP Card must include CPM/IOM
+    "sr-1-46s": {
         "deployment_model": "distributed",
         # control plane (CPM)
         "max_nics": 48,
         "cp": {
             "min_ram": 4,
-            "timos_line": "slot=A chassis=sr-1x-48D card=cpm-1x",
+            "timos_line": "slot=A chassis=sr-1-46s card=cpm-1x/i40-200g-sfpdd+6-800g-qsfpdd-1",  # CP Card must include CPM/IOM
         },
         # line card (IOM/XCM)
         "lcs": [
             {
                 "min_ram": 4,
                 **line_card_config(
-                    chassis="sr-1x-48D",
+                    chassis="sr-1-46s",
+                    card="i40-200g-sfpdd+6-800g-qsfpdd-1",
+                    mda="m40-200g-sfpdd+6-800g-qsfpdd-1",
+                ),
+            }
+        ],
+    },
+    # SR-1 FP5 - CP Card must include CPM/IOM
+    "sr-1-92s": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 48,
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=sr-1-92s card=cpm-1x/i80-200g-sfpdd+12-400g-qsfpdd-1",  # CP Card must include CPM/IOM
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="sr-1-92s",
+                    card="i80-200g-sfpdd+12-400g-qsfpdd-1",
+                    mda="m80-200g-sfpdd+12-400g-qsfpdd-1",
+                ),
+            }
+        ],
+    },
+    # SR-1 FP5 - CP Card must include CPM/IOM
+    "sr-1x-92s": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 48,
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=sr-1x-92s card=cpm-1x/i80-200g-sfpdd+12-800g-qsfpdd-1x",  # CP Card must include CPM/IOM
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="sr-1x-92s",
+                    card="i80-200g-sfpdd+12-800g-qsfpdd-1x",
+                    mda="m80-200g-sfpdd+12-800g-qsfpdd-1x",
+                ),
+            }
+        ],
+    },
+    # SR-1 FP5
+    "sr-1-24d": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 48,
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=sr-1-24d card=cpm-1x",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="sr-1-24d",
+                    card="i24-800g-qsfpdd-1",
+                    mda="m24-800g-qsfpdd-1",
+                ),
+            }
+        ],
+    },
+    # SR-1 FP5
+    "sr-1-48d": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 48,
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=sr-1-48D card=cpm-1x/i48-400g-qsfpdd-1",  # CP Card must include CPM/IOM
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="sr-1-48D",
+                    card="i48-400g-qsfpdd-1",
+                    mda="m48-400g-qsfpdd-1",
+                ),
+            }
+        ],
+    },
+    # SR-1 FP5
+    "sr-1x-48d": {
+        "deployment_model": "distributed",
+        # control plane (CPM)
+        "max_nics": 48,
+        "cp": {
+            "min_ram": 4,
+            "timos_line": "slot=A chassis=sr-1x-48d card=cpm-1x",
+        },
+        # line card (IOM/XCM)
+        "lcs": [
+            {
+                "min_ram": 4,
+                **line_card_config(
+                    chassis="sr-1x-48d",
                     card="i48-800g-qsfpdd-1x",
                     mda="m48-800g-qsfpdd-1x",
                 ),
@@ -432,19 +700,16 @@ SROS_VARIANTS = {
 # SR OS Classic CLI common configuration
 SROS_CL_COMMON_CFG = """
 /configure system name {name}
-/configure system netconf no shutdown
 /configure system security profile \"administrative\" netconf base-op-authorization lock
 /configure system login-control ssh inbound-max-sessions 30
-/configure system management-interface yang-modules no nokia-modules
-/configure system management-interface yang-modules nokia-combined-modules
 /configure system management-interface yang-modules no base-r13-modules
+/configure system netconf auto-config-save
+/configure system netconf no shutdown
 /configure system grpc allow-unsecure-connection
 /configure system grpc gnmi auto-config-save
 /configure system grpc gnmi no shutdown
 /configure system grpc rib-api no shutdown
 /configure system grpc no shutdown
-/configure system netconf auto-config-save
-/configure system netconf no shutdown
 /configure system security profile "administrative" netconf base-op-authorization kill-session
 /configure system security profile "administrative" netconf base-op-authorization lock
 /configure system snmp packet-size 9216
@@ -453,9 +718,10 @@ SROS_CL_COMMON_CFG = """
 /configure system security user "admin" access netconf
 /configure system security user "admin" access console
 /configure system security user "admin" access grpc
-/configure system security user "admin" access snmp
 /configure system security user "admin" access ftp
+/configure system security snmp community "public" r version v2c
 """
+
 
 # SR OS Model-Driven CLI common configuration
 SROS_MD_COMMON_CFG = """
@@ -467,19 +733,42 @@ SROS_MD_COMMON_CFG = """
 /configure system grpc allow-unsecure-connection
 /configure system grpc gnmi auto-config-save true
 /configure system grpc rib-api admin-state enable
-/configure system management-interface netconf admin-state enable
 /configure system management-interface netconf auto-config-save true
 /configure system management-interface snmp packet-size 9216
 /configure system management-interface snmp streaming admin-state enable
 /configure system security user-params local-user user "admin" access console true
 /configure system security user-params local-user user "admin" access ftp true
-/configure system security user-params local-user user "admin" access snmp true
 /configure system security user-params local-user user "admin" access netconf true
 /configure system security user-params local-user user "admin" access grpc true
+/configure system security snmp community "public" access-permissions r
+/configure system security snmp community "public" version v2c
+/configure system management-interface configuration-save configuration-backups 5
+/configure system management-interface configuration-save incremental-saves false
 """
 
-# to allow writing config to tftp location we needed to spin up a normal
-# tftp server in container host system. To access the host from qemu VM
+
+# get_version_specific_config returns the version specific configuration
+# based on the release number.
+def get_version_specific_config(major_version: int):
+    # releases <=22 boot with the classic CLI config by default
+    if major_version <= 22:
+        return """
+/configure system management-interface yang-modules no nokia-submodules
+/configure system management-interface yang-modules nokia-combined-modules
+"""
+    # 23.x releases use the Model-Driven CLI by default
+    if major_version == 23:
+        return """
+/configure system management-interface netconf admin-state enable
+"""
+    # releases 24.3.1 and above use a new command to enable netconf server
+    return """
+/configure system management-interface netconf listen admin-state enable
+"""
+
+
+# In host-forwarded mgmt mode, to allow writing config to tftp location we needed to spin up a normal
+# tftp server in a container host system. To access the host from qemu VM
 # we needed to put SR OS management interface in the container host network namespace
 # this is done by putting SR OS management interface with into a br-mgmt bridge
 # the bridge and SR OS mgmt interfaces will be addressed as follows
@@ -489,6 +778,11 @@ V4_PREFIX_LENGTH = "30"
 BRIDGE_V6_ADDR = "200::"
 SROS_MGMT_V6_ADDR = "200::1"
 V6_PREFIX_LENGTH = "127"
+
+# In pass-through mode, we also spin up a tftp server, but in this case we create a new namespace
+# inside the container that simulates the IP addressing of the host.
+# we redirect traffic to this ns by using tc flower filters
+FAKEHOST_VETH_MAC_ADDR = "3a:3a:3a:3a:3a:3a"
 
 
 def parse_variant_line(cfg, obj, skip_nics=False):
@@ -578,7 +872,7 @@ def parse_custom_variant(cfg):
 # sort line card definitions if they were provided in a non-consequetive order
 def sort_lc_lines_by_slot(lc_lines: list) -> list:
     max_slot = 99
-    timos_tuples = [(v.get("slot", max_slot), v) for v in lc_lines]
+    timos_tuples = [(int(v.get("slot", max_slot)), v) for v in lc_lines]
     sorted_timos = [t_tupple[1] for t_tupple in sorted(timos_tuples)]
     return sorted_timos
 
@@ -607,56 +901,122 @@ def uuid_rev_part(part):
     return res
 
 
-def gen_bof_config():
-    """generate bof configuration commands based on env vars and SR OS version"""
-    cmds = []
-    if "DOCKER_NET_V4_ADDR" in os.environ and os.getenv("DOCKER_NET_V4_ADDR") != "":
-        if SROS_VERSION.major >= 23:
-            cmds.append(
-                f'/bof router static-routes route {os.getenv("DOCKER_NET_V4_ADDR")} next-hop {BRIDGE_V4_ADDR}'
-            )
-        else:
-            cmds.append(
-                f'/bof static-route {os.getenv("DOCKER_NET_V4_ADDR")} next-hop {BRIDGE_V4_ADDR}'
-            )
-    if "DOCKER_NET_V6_ADDR" in os.environ and os.getenv("DOCKER_NET_V6_ADDR") != "":
-        if SROS_VERSION.major >= 23:
-            cmds.append(
-                f'/bof router static-routes route {os.getenv("DOCKER_NET_V6_ADDR")} next-hop {BRIDGE_V6_ADDR}'
-            )
-        else:
-            cmds.append(
-                f'/bof static-route {os.getenv("DOCKER_NET_V6_ADDR")} next-hop {BRIDGE_V6_ADDR}'
-            )
-    # if "docker-net-v6-addr" in m:
-    #     cmds.append(f"/bof static-route {m[docker-net-v6-addr]} next-hop {BRIDGE_ADDR}")
-    return cmds
-
-
 class SROS_vm(vrnetlab.VM):
     def __init__(self, username, password, ram, conn_mode, cpu=2, num=0):
-        super().__init__(username, password, disk_image="/sros.qcow2", num=num, ram=ram)
+        if not cpu or cpu == 0 or cpu == "0":
+            cpu = 2
+
+        super().__init__(
+            username,
+            password,
+            disk_image="/sros.qcow2",
+            num=num,
+            ram=ram,
+            driveif="virtio",
+            smp=f"{cpu}",
+            use_scrapli=True,
+        )
+
         self.nic_type = "virtio-net-pci"
         self.conn_mode = conn_mode
         self.uuid = "00000000-0000-0000-0000-000000000000"
         self.power = "dc"  # vSR emulates DC only
         self.read_license()
-        if not cpu or cpu == 0 or cpu == "0":
-            cpu = 2
-        self.cpu = cpu
-        self.qemu_args.extend(["-cpu", "host", "-smp", f"{cpu}"])
 
         # override default wait pattern with hash followed by the space
         self.wait_pattern = "# "
 
-    # override wait_write clean_buffer parameter default
-    def wait_write(self, cmd, wait="__defaultpattern__", con=None, clean_buffer=True):
-        super().wait_write(cmd, wait, con, clean_buffer)
+    def create_tc_tap_mgmt_ifup(self):
+        # override the parent's function with sros requirements
+        # this is used when using pass-through mode for mgmt connectivity
+        """Create tap ifup script that is used in tc datapath mode, specifically for the management interface"""
+        ifup_script = """#!/bin/bash
+
+        ip link set tap0 up
+        ip link set tap0 mtu 65000
+
+        # create tc eth<->tap redirect rules
+
+        tc qdisc add dev eth0 clsact
+        # exception for TCP ports 5000-5007
+        tc filter add dev eth0 ingress prio 1 protocol ip flower ip_proto tcp dst_port 5000-5007 action pass
+        # mirror ARP traffic to container
+        tc filter add dev eth0 ingress prio 2 protocol arp flower action mirred egress mirror dev tap0
+        # redirect rest of ingress traffic of eth0 to egress of tap0
+        tc filter add dev eth0 ingress prio 3 flower action mirred egress redirect dev tap0
+
+        tc qdisc add dev tap0 clsact
+        # redirect tftp traffic to fakehost ns
+        tc filter add dev tap0 ingress protocol ip prio 1	\
+	        flower ip_proto udp dst_port 69 dst_ip {MGMT_CONTAINER_GW} 	\
+            action pedit ex munge eth dst set {FAKEHOST_VETH_MAC_ADDR} pipe \
+	        action mirred egress redirect dev RA
+
+        tc filter add dev tap0 ingress protocol ip prio 2	\
+	        flower ip_proto udp dst_port 52400-52500 dst_ip {MGMT_CONTAINER_GW} 	\
+            action pedit ex munge eth dst set {FAKEHOST_VETH_MAC_ADDR} pipe \
+	        action mirred egress redirect dev RA
+
+        # redirect all ingress traffic of tap0 to egress of eth0
+        tc filter add dev tap0 ingress flower action mirred egress redirect dev eth0
+
+        # redirect tftp traffic coming from ns to the mgmt address of the sros VM
+        tc qdisc add dev RA clsact
+            tc filter add dev RA ingress protocol ip prio 1	\
+	        flower ip_proto udp src_port 69 dst_ip {MGMT_IP_ADDRESS} 	\
+	        action mirred egress redirect dev tap0
+        
+        tc filter add dev RA ingress protocol ip prio 2	\
+	        flower ip_proto udp src_port 52400-52500 dst_ip {MGMT_IP_ADDRESS} 	\
+	        action mirred egress redirect dev tap0
+
+        # clone management MAC of the VM
+        ip link set dev eth0 address {MGMT_MAC}
+
+        # configure the ip address of the namespace as it was the host and remove the temporary one
+        ip netns exec fakehost ip addr add {MGMT_CONTAINER_GW}/{MGMT_IP_PREFIXLEN} dev FA
+        ip netns exec fakehost ip addr del  169.254.254.254/16 dev FA
+        """
+
+        mgmt_ip_v4_address, mgmt_ip_v4_prefixlen = self.mgmt_address_ipv4.split("/")
+
+        ifup_script = ifup_script.replace("{MGMT_MAC}", self.mgmt_mac)
+        ifup_script = ifup_script.replace(
+            "{FAKEHOST_VETH_MAC_ADDR}", FAKEHOST_VETH_MAC_ADDR
+        )
+        ifup_script = ifup_script.replace("{MGMT_CONTAINER_GW}", self.mgmt_gw_ipv4)
+        ifup_script = ifup_script.replace("{MGMT_IP_PREFIXLEN}", mgmt_ip_v4_prefixlen)
+        ifup_script = ifup_script.replace("{MGMT_IP_ADDRESS}", mgmt_ip_v4_address)
+
+        with open("/etc/tc-tap-mgmt-ifup", "w") as f:
+            f.write(ifup_script)
+        os.chmod("/etc/tc-tap-mgmt-ifup", 0o777)
+
+    def attach_cf(self, slot, cfname, size):
+        """Attach extra CF. Create if needed."""
+        cfname = cfname.lower()
+        path = f"/tftpboot/{cfname}_{slot}.qcow2"
+
+        if not os.path.exists(path):
+            self.logger.debug(
+                f"Slot {slot}: creating {cfname} disk with size {size} -> {path}"
+            )
+            vrnetlab.run_command(["qemu-img", "create", "-f", "qcow2", path, size])
+        else:
+            self.logger.debug(
+                f"Slot {slot}: bypassed creation of {cfname} disk because it already exist -> {path}. "
+            )
+
+        disk_idx = 1
+        if cfname == "cf2":
+            disk_idx = 2
+
+        self.qemu_args.extend(["-drive", f"if=virtio,index={disk_idx},file={path}"])
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
 
-        (ridx, match, res) = self.tn.expect([b"Login:", b"^[^ ]+#"], 1)
+        (ridx, match, res) = self.con_expect([b"Login:", b"^[^ ]+#"])
         if match:  # got a match!
             if ridx == 0:  # matched login prompt, so should login
                 self.logger.debug("matched login prompt")
@@ -665,7 +1025,7 @@ class SROS_vm(vrnetlab.VM):
             # run main config!
             self.bootstrap_config()
             # close telnet connection
-            self.tn.close()
+            self.scrapli_tn.close()
             # calc startup time
             startup_time = datetime.datetime.now() - self.start_time
             self.logger.info("Startup complete in: %s" % startup_time)
@@ -675,7 +1035,7 @@ class SROS_vm(vrnetlab.VM):
         # no match, if we saw some output from the router it's probably
         # booting, so let's give it some more time
         if res != b"":
-            self.logger.trace("OUTPUT: %s" % res.decode())
+            self.write_to_stdout(res)
             # reset spins if we saw some output
             self.spins = 0
 
@@ -730,75 +1090,158 @@ class SROS_vm(vrnetlab.VM):
         # power_path sets the configuration path to access power shelf and module
         # it is different for SR OS version <= 22
         power_path = "chassis router chassis-number 1"
-        if SROS_VERSION.major <= 22:
+        if classic_cfg:
             power_path = "system"
 
         for s in range(1, shelves + 1):
-            self.wait_write(
-                f"/configure {power_path} power-shelf {s} power-shelf-type {power_shelf_type}"
+            res = self.sros_con.send_configs(
+                [
+                    f"/configure {power_path} power-shelf {s} power-shelf-type {power_shelf_type}"
+                ],
+                strip_prompt=False,
             )
+            self.log_scrapli_cmd_res(res)
             for m in range(1, modules + 1):
-                self.wait_write(
-                    f"/configure {power_path} power-shelf {s} power-module {m} power-module-type {module_type}"
+                res = self.sros_con.send_configs(
+                    [
+                        f"/configure {power_path} power-shelf {s} power-module {m} power-module-type {module_type}"
+                    ],
+                    strip_prompt=False,
                 )
+                self.log_scrapli_cmd_res(res)
 
     def enterConfig(self):
-        """Enter configuration mode. No-op for SR OS version <= 22"""
-        if SROS_VERSION.major <= 22:
+        """Enter configuration mode. No-op for SR OS version <= 22 (classic CLI)"""
+        if classic_cfg:
             return
-        self.wait_write("edit-config exclusive")
+        self.sros_con.acquire_priv("configuration")
 
     def enterBofConfig(self):
-        """Enter bof configuration mode. No-op for SR OS version <= 22"""
-        if SROS_VERSION.major <= 22:
+        """Enter bof configuration mode. No-op for SR OS version <= 22 (classic CLI)"""
+        if classic_cfg:
             return
-        self.wait_write("edit-config bof exclusive")
+        res = self.sros_con.send_commands(
+            ["edit-config bof exclusive"], strip_prompt=False
+        )
+        self.log_scrapli_cmd_res(res)
 
     def commitConfig(self):
-        """Commit configuration. No-op for SR OS version <= 22"""
-        if SROS_VERSION.major <= 22:
+        """Commit configuration. No-op for SR OS version <= 22 (classic CLI)"""
+        if classic_cfg:
             return
-        self.wait_write("commit")
-        self.wait_write("/")
-        self.wait_write("quit-config")
+        res = self.sros_con.send_configs(["commit", "quit-config"], strip_prompt=False)
+        self.log_scrapli_cmd_res(res)
 
     def commitBofConfig(self):
-        """Commit configuration. No-op for SR OS version <= 22"""
-        if SROS_VERSION.major <= 22:
+        """Commit configuration. No-op for SR OS version <= 22 (classic CLI)"""
+        if classic_cfg:
             return
-        self.wait_write("commit")
-        self.wait_write("/")
-        self.wait_write("quit-config")
+        res = self.sros_con.send_configs(["commit", "quit-config"], strip_prompt=False)
+        self.log_scrapli_cmd_res(res)
 
     def configureCards(self):
         """Configure cards"""
         # integrated vsims have `card_config` in the variant definition
         if "card_config" in self.variant:
-            for line in iter(self.variant["card_config"].splitlines()):
-                self.wait_write(line)
+            res = self.sros_con.send_configs(
+                self.variant["card_config"].splitlines(), strip_prompt=False
+            )
+            self.log_scrapli_cmd_res(res)
         # else this might be a distributed chassis
         elif self.variant.get("lcs") is not None:
             for lc in self.variant["lcs"]:
                 if "card_config" in lc:
-                    for line in iter(lc["card_config"].splitlines()):
-                        self.wait_write(line)
+                    res = self.sros_con.send_configs(
+                        lc["card_config"].splitlines(), strip_prompt=False
+                    )
+                    self.log_scrapli_cmd_res(res)
 
     def persistBofAndConfig(self):
         """ "Persist bof and config"""
-        if SROS_VERSION.major <= 22:
-            self.wait_write("/bof save")
-            self.wait_write("/admin save")
+        if SROS_VERSION.magc:
+            cmds = ["/bof save cf3:"]
+        elif classic_cfg:
+            cmds = ["/bof save"]
         else:
-            self.wait_write("/admin save bof")
-            self.wait_write("/admin save")
+            cmds = ["/admin save bof"]
+
+        cmds.append("/admin save")
+        res = self.sros_con.send_commands(cmds, strip_prompt=False)
+        self.log_scrapli_cmd_res(res)
 
     def switchConfigEngine(self):
         """Switch configuration engine"""
-        if SROS_VERSION.major <= 22:
-            # for SR OS version <= 22, we enforce MD-CLI by switching to it
-            self.wait_write(
-                f"/configure system management-interface configuration-mode {self.mode}"
+        if (SROS_VERSION.major >= 19 and SROS_VERSION.major <= 22) or SROS_VERSION.magc:
+            # for SR OS versions 19-22 inclusive, we enforce MD-CLI by switching to it
+            res = self.sros_con.send_configs(
+                [
+                    f"/configure system management-interface configuration-mode {self.mode}"
+                ],
+                strip_prompt=False,
             )
+            self.log_scrapli_cmd_res(res)
+
+    def gen_bof_config(self):
+        """generate bof configuration commands based on env vars and SR OS version"""
+        cmds = []
+        if "DOCKER_NET_V4_ADDR" in os.environ and os.getenv("DOCKER_NET_V4_ADDR") != "":
+            if self.mgmt_passthrough:
+                # in pass-trough mode we configure static routes for the IPv4 private space
+                if SROS_VERSION.major >= 23 and not classic_cfg:
+                    cmds.append(
+                        f"/bof router static-routes route 100.64.0.0/10 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof router static-routes route 10.0.0.0/8 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof router static-routes route 172.16.0.0/12 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof router static-routes route 192.168.0.0/16 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                else:
+                    cmds.append(
+                        f"/bof static-route 100.64.0.0/10 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof static-route 10.0.0.0/8 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof static-route 172.16.0.0/12 next-hop {self.mgmt_gw_ipv4}"
+                    )
+                    cmds.append(
+                        f"/bof static-route 192.168.0.0/16 next-hop {self.mgmt_gw_ipv4}"
+                    )
+            else:
+                if SROS_VERSION.major >= 23 and not classic_cfg:
+                    cmds.append(
+                        f"/bof router static-routes route {os.getenv('DOCKER_NET_V4_ADDR')} next-hop {BRIDGE_V4_ADDR}"
+                    )
+                else:
+                    cmds.append(
+                        f"/bof static-route {os.getenv('DOCKER_NET_V4_ADDR')} next-hop {BRIDGE_V4_ADDR}"
+                    )
+        if "DOCKER_NET_V6_ADDR" in os.environ and os.getenv("DOCKER_NET_V6_ADDR") != "":
+            if not self.mgmt_passthrough:
+                if SROS_VERSION.major >= 23 and not classic_cfg:
+                    cmds.append(
+                        f"/bof router static-routes route {os.getenv('DOCKER_NET_V6_ADDR')} next-hop {BRIDGE_V6_ADDR}"
+                    )
+                else:
+                    cmds.append(
+                        f"/bof static-route {os.getenv('DOCKER_NET_V6_ADDR')} next-hop {BRIDGE_V6_ADDR}"
+                    )
+        # if "docker-net-v6-addr" in m:
+        #     cmds.append(f"/bof static-route {m[docker-net-v6-addr]} next-hop {BRIDGE_ADDR}")
+        return cmds
+
+    def log_scrapli_cmd_res(self, res: list):
+        if not LOG_SCRAPLI:
+            return
+        for response in res:
+            self.logger.debug(f"CHANNEL INPUT: {response.channel_input}")
+            self.logger.debug(f"OUTPUT:\n{response.result}")
 
     def bootstrap_config(self):
         """Common function used to push initial configuration for bof and config to
@@ -807,24 +1250,72 @@ class SROS_vm(vrnetlab.VM):
         # configure bof before we check if config file was provided
         # since bof statements are not part of the config file
         # thus it must be applied unconditionally
+
+        # init scrapli sros driver
+        scrapli_timeout = os.getenv("SCRAPLI_TIMEOUT", vrnetlab.DEFAULT_SCRAPLI_TIMEOUT)
+        self.logger.info(
+            f"Scrapli timeout is {scrapli_timeout}s (default {vrnetlab.DEFAULT_SCRAPLI_TIMEOUT}s)"
+        )
+
+        # check if config was provided
+        config_exists = os.path.isfile("/tftpboot/config.txt")
+        fmt_config_exists = vrnetlab.format_bool_color(
+            config_exists, "exists", "does not exist"
+        )
+        self.logger.debug(f"Configuration file {fmt_config_exists}")
+
+        # init scrapli
+        sros_scrapli_dev = {
+            "platform": "nokia_sros",
+            "host": "127.0.0.1",
+            "auth_bypass": True,
+            "auth_strict_key": False,
+            "timeout_socket": scrapli_timeout,
+            "timeout_transport": scrapli_timeout,
+            "timeout_ops": scrapli_timeout,
+        }
+
+        # SROS <= 22 use classic configuration mode by defaults
+        # other functions rely on this variable to determine what cmds to send
+        global classic_cfg
+        classic_cfg = True if SROS_VERSION.major <= 22 or SROS_VERSION.magc else False
+
+        if config_exists:
+            with open("/tftpboot/config.txt") as startup_cfg:
+                for line in startup_cfg:
+                    l_clean = line.strip()
+                    if "configure" == l_clean and "{" not in l_clean:
+                        self.logger.debug("Detected classic startup configuration")
+                        classic_cfg = True
+                        break
+
+        if classic_cfg:
+            sros_scrapli_dev["variant"] = "classic"
+
+        self.sros_con = Scrapli(**sros_scrapli_dev)
+        self.sros_con.commandeer(conn=self.scrapli_tn)
+
+        # configure BOF
         self.enterBofConfig()
-        for line in iter(gen_bof_config()):
-            self.wait_write(line)
+
+        # send and log BOF config
+        res = self.sros_con.send_configs(self.gen_bof_config(), strip_prompt=False)
+        self.log_scrapli_cmd_res(res)
+
         self.commitBofConfig()
-        # save bof config on disk
-        self.persistBofAndConfig()
 
         # apply common configuration if config file was not provided
-        if not os.path.isfile("/tftpboot/config.txt"):
-            self.logger.info("Applying basic SR OS configuration...")
+        if not config_exists:
+            self.logger.debug("Applying basic SR OS configuration...")
 
             # enter config mode, no-op for sros <=22
             self.enterConfig()
 
-            for line in iter(
-                getDefaultConfig().format(name=self.hostname).splitlines()
-            ):
-                self.wait_write(line)
+            res = self.sros_con.send_configs(
+                getDefaultConfig().format(name=self.hostname).splitlines(),
+                strip_prompt=False,
+            )
+            self.log_scrapli_cmd_res(res)
 
             # configure card/mda of a given variant
             self.configureCards()
@@ -835,10 +1326,29 @@ class SROS_vm(vrnetlab.VM):
 
             self.commitConfig()
 
+            self.persistBofAndConfig()
+
             self.switchConfigEngine()
 
-            # logout at the end of execution
-            self.wait_write("/logout")
+        # close scrapli device driver
+        self.sros_con.close()
+
+    @property
+    def ram(self):
+        """Ignore environment variables here, since getMem function is used"""
+        return self._ram
+
+    @property
+    def cpu(self):
+        """Ignore environment variables here, since CPU environment variable is used for number of cpus in getCPU function"""
+
+        return str(self._cpu)
+
+    @property
+    def smp(self):
+        """Ignore environment variables here, since CPU environment variable is used for number of cpus in getCPU function"""
+
+        return str(self._smp)
 
 
 class SROS_integrated(SROS_vm):
@@ -847,8 +1357,9 @@ class SROS_integrated(SROS_vm):
     def __init__(
         self, hostname, username, password, mode, num_nics, variant, conn_mode
     ):
-        ram: int = vrnetlab.getMem("integrated", variant.get("min_ram"))
-        cpu: int = vrnetlab.getCpu("integrated", variant.get("cpu"))
+        ram: int = getMem("integrated", variant.get("min_ram"))
+        cpu: int = getCpu("integrated", variant.get("cpu"))
+        slot: str = "A"
 
         super().__init__(
             username,
@@ -860,15 +1371,31 @@ class SROS_integrated(SROS_vm):
         self.mode = mode
         self.role = "integrated"
         self.num_nics = num_nics
-        self.smbios = [
-            f"type=1,product=TIMOS:address={SROS_MGMT_V4_ADDR}/{V4_PREFIX_LENGTH}@active "
-            f"address={SROS_MGMT_V6_ADDR}/{V6_PREFIX_LENGTH}@active license-file=tftp://{BRIDGE_V4_ADDR}/"
-            f"license.txt primary-config=tftp://{BRIDGE_V4_ADDR}/config.txt system-base-mac={vrnetlab.gen_mac(0)} "
-            f"{variant['timos_line']}"
-        ]
+
+        if self.mgmt_passthrough:
+            self.smbios = [
+                f"type=1,product=TIMOS:address={self.mgmt_address_ipv4}@active "
+                f"address={self.mgmt_address_ipv6}@active "
+                f"license-file=tftp://{self.mgmt_gw_ipv4}/"
+                f"license.txt primary-config=tftp://{self.mgmt_gw_ipv4}/config.txt system-base-mac={vrnetlab.gen_mac(0)} "
+                f"{variant['timos_line']}"
+            ]
+        else:
+            self.smbios = [
+                f"type=1,product=TIMOS:address={SROS_MGMT_V4_ADDR}/{V4_PREFIX_LENGTH}@active "
+                f"address={SROS_MGMT_V6_ADDR}/{V6_PREFIX_LENGTH}@active license-file=tftp://{BRIDGE_V4_ADDR}/"
+                f"license.txt primary-config=tftp://{BRIDGE_V4_ADDR}/config.txt system-base-mac={vrnetlab.gen_mac(0)} "
+                f"{variant['timos_line']}"
+            ]
         self.logger.info("Acting timos line: {}".format(self.smbios))
         self.variant = variant
         self.hostname = hostname
+
+        # Optional CFs indicated by environment variable. The value indicate the SIZE to be passed directly to qemu-img create (eg: CF1=1G)
+        for cf in ["CF1", "CF2"]:
+            if cf in os.environ:
+                disk_size = os.getenv(cf)
+                self.attach_cf(slot=slot, cfname=cf, size=disk_size)
 
     def gen_mgmt(self):
         """
@@ -877,18 +1404,37 @@ class SROS_integrated(SROS_vm):
 
         res = []
 
-        res.append("-device")
+        self.mgmt_mac = self.get_mgmt_mac()
 
-        res.append(
-            self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": vrnetlab.gen_mac(0)}
-        )
-        res.append("-netdev")
-        res.append("bridge,br=br-mgmt,id=br-mgmt" % {"i": 0})
+        if self.mgmt_passthrough:
+            res.append("-device")
+            res.append("virtio-net-pci,netdev=p00,mac=%s" % self.mgmt_mac)
+            res.append("-netdev")
+            res.append(
+                "tap,ifname=tap0,id=p00,script=/etc/tc-tap-mgmt-ifup,downscript=no"
+            )
+            self.create_tc_tap_mgmt_ifup()
 
-        if any(chassis in self.variant["timos_line"] for chassis in ["chassis=ixr-r6", "chassis=ixr-ec", "chassis=ixr-e2"]):
+        else:
+            res.append("-device")
 
-            logger.debug(
-                "detected ixr-r6/ec/ixr-e2 chassis, creating a dummy network device for SFM connection"
+            res.append(
+                self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": self.mgmt_mac}
+            )
+            res.append("-netdev")
+            res.append("bridge,br=br-mgmt,id=br-mgmt" % {"i": 0})
+
+        if any(
+            chassis in self.variant["timos_line"]
+            for chassis in [
+                "chassis=ixr-r6",
+                "chassis=ixr-ec",
+                "chassis=ixr-e2",
+                "chassis=ixr-e2c",
+            ]
+        ):
+            self.logger.debug(
+                "detected ixr-r6/ixr-ec/ixr-e2/ixr-e2c chassis, creating a dummy network device for SFM connection"
             )
             res.append(f"-device virtio-net-pci,netdev=dummy,mac={vrnetlab.gen_mac(0)}")
             res.append("-netdev tap,ifname=sfm-dummy,id=dummy,script=no,downscript=no")
@@ -903,8 +1449,9 @@ class SROS_cp(SROS_vm):
         # cp - control plane. role is used to create a separate overlay image name
         self.role = "cp"
 
-        ram: int = vrnetlab.getMem(self.role, variant.get("cp").get("min_ram"))
-        cpu: int = vrnetlab.getCpu(self.role, variant.get("cp").get("cpu"))
+        ram: int = getMem(self.role, variant.get("cp").get("min_ram"))
+        cpu: int = getCpu(self.role, variant.get("cp").get("cpu"))
+        slot: str = variant.get("cp").get("slot")
 
         super(SROS_cp, self).__init__(
             username,
@@ -917,15 +1464,29 @@ class SROS_cp(SROS_vm):
         self.num_nics = 0
         self.hostname = hostname
         self.variant = variant
-
-        self.smbios = [
-            f"type=1,product=TIMOS:address={SROS_MGMT_V4_ADDR}/{V4_PREFIX_LENGTH}@active "
-            f"address={SROS_MGMT_V6_ADDR}/{V6_PREFIX_LENGTH}@active "
-            f"license-file=tftp://{BRIDGE_V4_ADDR}/license.txt "
-            f"primary-config=tftp://{BRIDGE_V4_ADDR}/config.txt "
-            f"system-base-mac={vrnetlab.gen_mac(0)} {variant['cp']['timos_line']}"
-        ]
+        if self.mgmt_passthrough:
+            self.smbios = [
+                f"type=1,product=TIMOS:address={self.mgmt_address_ipv4}@active "
+                f"address={self.mgmt_address_ipv6}@active "
+                f"license-file=tftp://{self.mgmt_gw_ipv4}/"
+                f"license.txt primary-config=tftp://{self.mgmt_gw_ipv4}/config.txt system-base-mac={vrnetlab.gen_mac(0)} "
+                f"{variant['cp']['timos_line']}"
+            ]
+        else:
+            self.smbios = [
+                f"type=1,product=TIMOS:address={SROS_MGMT_V4_ADDR}/{V4_PREFIX_LENGTH}@active "
+                f"address={SROS_MGMT_V6_ADDR}/{V6_PREFIX_LENGTH}@active "
+                f"license-file=tftp://{BRIDGE_V4_ADDR}/license.txt "
+                f"primary-config=tftp://{BRIDGE_V4_ADDR}/config.txt "
+                f"system-base-mac={vrnetlab.gen_mac(0)} {variant['cp']['timos_line']}"
+            ]
         self.logger.info("Acting timos line: {}".format(self.smbios))
+
+        # Optional CFs indicated by environment variable. The value indicate the SIZE to be passed directly to qemu-img create (eg: CF1=1G)
+        for cf in ["CF1", "CF2"]:
+            if cf in os.environ:
+                disk_size = os.getenv(cf)
+                self.attach_cf(slot=slot, cfname=cf, size=disk_size)
 
     def start(self):
         # use parent class start() function
@@ -948,13 +1509,24 @@ class SROS_cp(SROS_vm):
         """
         res = []
 
-        res.append("-device")
+        self.mgmt_mac = self.get_mgmt_mac()
 
-        res.append(
-            self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": vrnetlab.gen_mac(0)}
-        )
-        res.append("-netdev")
-        res.append("bridge,br=br-mgmt,id=br-mgmt" % {"i": 0})
+        if self.mgmt_passthrough:
+            res.append("-device")
+            res.append("virtio-net-pci,netdev=p00,mac=%s" % self.mgmt_mac)
+            res.append("-netdev")
+            res.append(
+                "tap,ifname=tap0,id=p00,script=/etc/tc-tap-mgmt-ifup,downscript=no"
+            )
+            self.create_tc_tap_mgmt_ifup()
+        else:
+            res.append("-device")
+
+            res.append(
+                self.nic_type + ",netdev=br-mgmt,mac=%(mac)s" % {"mac": self.mgmt_mac}
+            )
+            res.append("-netdev")
+            res.append("bridge,br=br-mgmt,id=br-mgmt")
 
         # add virtio NIC for internal control plane interface to vFPC
         res.append("-device")
@@ -971,8 +1543,8 @@ class SROS_lc(SROS_vm):
         # role lc if for a line card. role is used to create a separate overlay image name
         self.role = "lc"
 
-        ram: int = vrnetlab.getMem(self.role, lc_config.get("min_ram"))
-        cpu: int = vrnetlab.getCpu(self.role, lc_config.get("cpu"))
+        ram: int = getMem(self.role, lc_config.get("min_ram"))
+        cpu: int = getCpu(self.role, lc_config.get("cpu"))
 
         super(SROS_lc, self).__init__(
             None,
@@ -1027,14 +1599,23 @@ class SROS_lc(SROS_vm):
     def bootstrap_spin(self):
         """We have nothing to do for VSR-SIM line cards"""
         self.running = True
-        self.tn.close()
+        self.scrapli_tn.close()
         return
 
 
 # SROS is main class for VSR-SIM
 class SROS(vrnetlab.VR):
-    def __init__(self, hostname, username, password, mode, variant_name, conn_mode):
-        super().__init__(username, password)
+    def __init__(
+        self,
+        hostname,
+        username,
+        password,
+        mode,
+        variant_name,
+        conn_mode,
+        mgmt_passthrough,
+    ):
+        super().__init__(username, password, mgmt_passthrough)
 
         if variant_name.lower() in SROS_VARIANTS:
             variant = SROS_VARIANTS[variant_name.lower()]
@@ -1044,6 +1625,9 @@ class SROS(vrnetlab.VR):
                     parse_variant_line(lc.get("timos_line", ""), lc)
                     for lc in variant["lcs"]
                 ]
+                variant["cp"] = parse_variant_line(
+                    variant["cp"]["timos_line"], variant["cp"]
+                )
         else:
             variant = parse_custom_variant(variant_name)
 
@@ -1067,7 +1651,9 @@ class SROS(vrnetlab.VR):
         self.logger.info(f"Number of NICs: {variant['max_nics']}")
         self.logger.info("Configuration mode: " + str(mode))
 
-        self.setupMgmtBridge()
+        # if we are in host-forwarded then we need to create Mgmt bridge
+        if not self.mgmt_passthrough:
+            self.setupMgmtBridge()
 
         if variant["deployment_model"] == "distributed":
             # CP VM instantiation
@@ -1185,8 +1771,10 @@ class SROS(vrnetlab.VR):
 
     def extractVersion(self):
         """extractVersion extracts the SR OS version from the qcow2 image name"""
-        # https://regex101.com/r/SPefOu/1
-        pattern = r"\S+-((\d{1,3})\.(\d{1,2})\.\w(\d{1,2}))\.qcow2"
+        # https://regex101.com/r/V9jNHc/1
+        pattern = (
+            r"(magc-)?\S+-((\d{1,3})\.(\d{1,2})\.\w(\d{1,2}(?:-\d{1,2})?))\.qcow2$"
+        )
         match_found = False
 
         for e in os.listdir("/"):
@@ -1194,11 +1782,11 @@ class SROS(vrnetlab.VR):
             if match:
                 # save original qcow2 image name
                 self.qcow_name = e
-
-                SROS_VERSION.version = str(match.group(1))
-                SROS_VERSION.major = int(match.group(2))
-                SROS_VERSION.minor = int(match.group(3))
-                SROS_VERSION.patch = int(match.group(4))
+                SROS_VERSION.magc = bool(match.group(1))
+                SROS_VERSION.version = str(match.group(2))
+                SROS_VERSION.major = int(match.group(3))
+                SROS_VERSION.minor = int(match.group(4))
+                SROS_VERSION.patch = str(match.group(5))
                 self.logger.info(f"Parsed SR OS version: {SROS_VERSION}")
 
                 match_found = True
@@ -1221,11 +1809,10 @@ def getDefaultConfig() -> str:
     """Returns the default configuration for the system based on the SR OS version.
     SR OS >=23 uses model-driven configuration, while SR OS <=22 uses classic configuration.
     """
+    if classic_cfg:
+        return SROS_CL_COMMON_CFG + get_version_specific_config(SROS_VERSION.major)
 
-    if SROS_VERSION.major <= 22:
-        return SROS_CL_COMMON_CFG
-
-    return SROS_MD_COMMON_CFG
+    return SROS_MD_COMMON_CFG + get_version_specific_config(SROS_VERSION.major)
 
 
 if __name__ == "__main__":
@@ -1264,64 +1851,121 @@ if __name__ == "__main__":
     if args.trace:
         logger.setLevel(1)
 
-    vrnetlab.run_command(
-        [
-            "in.tftpd",
-            "--listen",
-            "--user",
-            "tftp",
-            "-a",
-            "0.0.0.0:69",
-            "-s",
-            "-c",
-            "-v",
-            "-p",
-            "/tftpboot",
-        ]
-    )
+    # set management interface mode to pass-through or host-forwarded
+    # host-forwarded is the original vrnetlab mode where SR OS gets a static IP for its bof address,
+    # which does not match the eth0 interface of a container.
+    # In pass-through mode the SR OS container uses the same IP as the container's eth0 interface and transparently forwards traffic between the two interfaces.
+    mgmt_passthrough = False
+    if os.getenv("CLAB_MGMT_PASSTHROUGH", "").lower() == "true":
+        mgmt_passthrough = True
 
-    # make tftpboot writable for saving SR OS config
-    vrnetlab.run_command(["chmod", "-R", "777", "/tftpboot"])
+    # In host-forwarded mode the container runs a tftp server in the root namespace of the container.
+    if not mgmt_passthrough:
+        vrnetlab.run_command(
+            [
+                "in.tftpd",
+                "--listen",
+                "--user",
+                "root",
+                "-a",
+                "0.0.0.0:69",
+                "-s",
+                "-c",
+                "-v",
+                "-p",
+                "/tftpboot",
+            ]
+        )
 
-    # kill origin socats since we use bridge interface
-    # for SR OS management interface
-    # thus we need to forward connections to a different address
-    vrnetlab.run_command(["pkill", "socat"])
+        # make tftpboot writable for saving SR OS config
+        vrnetlab.run_command(["chmod", "-R", "777", "/tftpboot"])
 
-    # redirecting incoming tcp traffic (except serial port 5000) from eth0 to SR management interface
-    vrnetlab.run_command(
-        f"iptables-nft -t nat -A PREROUTING -i eth0 -p tcp ! --dport 5000 -j DNAT --to-destination {SROS_MGMT_V4_ADDR}".split()
-    )
-    vrnetlab.run_command(
-        f"ip6tables-nft -t nat -A PREROUTING -i eth0 -p tcp ! --dport 5000 -j DNAT --to-destination {SROS_MGMT_V6_ADDR}".split()
-    )
-    # same redirection but for UDP
-    vrnetlab.run_command(
-        f"iptables-nft -t nat -A PREROUTING -i eth0 -p udp -j DNAT --to-destination {SROS_MGMT_V4_ADDR}".split()
-    )
-    vrnetlab.run_command(
-        f"ip6tables-nft -t nat -A PREROUTING -i eth0 -p udp -j DNAT --to-destination {SROS_MGMT_V6_ADDR}".split()
-    )
-    # masquerading the incoming traffic so SR OS is able to reply back
-    vrnetlab.run_command(
-        "iptables-nft -t nat -A POSTROUTING -o br-mgmt -j MASQUERADE".split()
-    )
-    vrnetlab.run_command(
-        "ip6tables-nft -t nat -A POSTROUTING -o br-mgmt -j MASQUERADE".split()
-    )
-    # allow sros breakout to management network by NATing via eth0
-    vrnetlab.run_command(
-        "iptables-nft -t nat -A POSTROUTING -o eth0 -j MASQUERADE".split()
-    )
-    vrnetlab.run_command(
-        "ip6tables-nft -t nat -A POSTROUTING -o eth0 -j MASQUERADE".split()
-    )
+        # kill origin socats since we use bridge interface
+        # for SR OS management interface
+        # thus we need to forward connections to a different address
+        vrnetlab.run_command(["pkill", "socat"])
 
-    logger.debug(
-        f"acting flags: username '{args.username}', password '{args.password}', connection-mode '{args.connection_mode}', variant '{args.variant}'"
-    )
+        # redirecting incoming tcp traffic (except serial port 5000) from eth0 to SR management interface
+        vrnetlab.run_command(
+            f"iptables-nft -t nat -A PREROUTING -i eth0 -p tcp ! --dport 5000 -j DNAT --to-destination {SROS_MGMT_V4_ADDR}".split()
+        )
+        vrnetlab.run_command(
+            f"ip6tables-nft -t nat -A PREROUTING -i eth0 -p tcp ! --dport 5000 -j DNAT --to-destination {SROS_MGMT_V6_ADDR}".split()
+        )
+        # same redirection but for UDP
+        vrnetlab.run_command(
+            f"iptables-nft -t nat -A PREROUTING -i eth0 -p udp -j DNAT --to-destination {SROS_MGMT_V4_ADDR}".split()
+        )
+        vrnetlab.run_command(
+            f"ip6tables-nft -t nat -A PREROUTING -i eth0 -p udp -j DNAT --to-destination {SROS_MGMT_V6_ADDR}".split()
+        )
+        # masquerading the incoming traffic so SR OS is able to reply back
+        vrnetlab.run_command(
+            "iptables-nft -t nat -A POSTROUTING -o br-mgmt -j MASQUERADE".split()
+        )
+        vrnetlab.run_command(
+            "ip6tables-nft -t nat -A POSTROUTING -o br-mgmt -j MASQUERADE".split()
+        )
+        # allow sros breakout to management network by NATing via eth0
+        vrnetlab.run_command(
+            "iptables-nft -t nat -A POSTROUTING -o eth0 -j MASQUERADE".split()
+        )
+        vrnetlab.run_command(
+            "ip6tables-nft -t nat -A POSTROUTING -o eth0 -j MASQUERADE".split()
+        )
 
-    logger.debug(f"Environment variables: {os.environ}")
+    # In management pass-through mode the container runs a tftp server in a dedicated namepace.
+    # This namespace will use the IPv4 default gateway of the container as interface
+    # tc flower rules will intercept tftp traffic and redirect it to this namespace
+
+    else:
+        # create namespace
+        vrnetlab.run_command("ip netns add fakehost".split())
+        # create vethts: FA in fakehost ns, RA in "root" ns
+        vrnetlab.run_command("ip link add FA type veth peer name RA".split())
+        # assign FA veth to ns
+        vrnetlab.run_command("ip link set FA netns fakehost".split())
+        # enable veth root ns
+        vrnetlab.run_command("ip link set RA up".split())
+        # enable loop in ns
+        vrnetlab.run_command("ip netns exec fakehost ip link set dev lo up".split())
+        # enable veth in fakehost ns
+        vrnetlab.run_command("ip netns exec fakehost ip link set FA up".split())
+        # assign a dummy mac that will not collide with the real docker bridge mac address
+        vrnetlab.run_command(
+            f"ip netns exec fakehost  ip link set dev FA address {FAKEHOST_VETH_MAC_ADDR}".split()
+        )
+        # configure a temporary ip address so the tftp server can start.
+        # modified later in the startup process in the create_tc_tap_mgmt_ifup function
+        vrnetlab.run_command(
+            "ip netns exec fakehost ip addr add 169.254.254.254/16 dev FA".split()
+        )
+        # block arp responses in fakehost namespace so it doesn't interfere with root namespace
+        vrnetlab.run_command(
+            "ip netns exec fakehost sysctl -w net.ipv4.conf.all.arp_ignore=8".split()
+        )
+        # start tftp in ns, assign ports to server so it's easier to track it with flower filters
+        vrnetlab.run_command(
+            [
+                "ip",
+                "netns",
+                "exec",
+                "fakehost",
+                "in.tftpd",
+                "--listen",
+                "--user",
+                "root",
+                "-a",
+                "0.0.0.0:69",
+                "-R",
+                "52400:52500",
+                "-s",
+                "-c",
+                "-v",
+                "-p",
+                "/tftpboot",
+            ]
+        )
 
     vrnetlab.boot_delay()
 
@@ -1332,5 +1976,9 @@ if __name__ == "__main__":
         mode=args.mode,
         variant_name=args.variant,
         conn_mode=args.connection_mode,
+        mgmt_passthrough=mgmt_passthrough,
     )
-    ia.start(add_fwd_rules=False)
+    ia.logger.debug(
+        f"acting flags: username '{args.username}', password '{args.password}', connection-mode '{args.connection_mode}', variant '{args.variant}'"
+    )
+    ia.start()

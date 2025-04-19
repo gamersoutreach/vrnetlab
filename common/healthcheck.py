@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import sys
 
 try:
@@ -12,7 +10,7 @@ except FileNotFoundError:
 
 exit_status, message = health.strip().split(" ", 1)
 
-if message != '':
+if message != "":
     print(message)
 
 sys.exit(int(exit_status))

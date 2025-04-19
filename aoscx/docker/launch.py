@@ -47,14 +47,12 @@ class AOSCX_vm(vrnetlab.VM):
             logging.getLogger().info("Disk image was not found")
             exit(1)
         super(AOSCX_vm, self).__init__(
-            username, password, disk_image=disk_image, ram=4096
+            username, password, disk_image=disk_image, ram=8192, cpu="host", smp="4"
         )
         self.hostname = hostname
         self.conn_mode = conn_mode
         self.num_nics = 20
         self.nic_type = "virtio-net-pci"
-        self.qemu_args.extend(["-cpu", "host,level=9"])
-        self.qemu_args.extend(["-smp", "2"])
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
@@ -116,6 +114,7 @@ class AOSCX_vm(vrnetlab.VM):
         # configure mgmt interface
         self.wait_write("interface mgmt")
         self.wait_write("ip static 10.0.0.15/24")
+        self.wait_write("default-gateway 10.0.0.2")
         self.wait_write("no shutdown")
         self.wait_write("exit")
         self.wait_write("ssh server vrf mgmt")
@@ -126,6 +125,7 @@ class AOSCX_vm(vrnetlab.VM):
 
         self.wait_write("end")
         self.wait_write("write memory")
+        self.wait_write("")
 
     def startup_config(self):
         """Load additional config provided by user."""
